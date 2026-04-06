@@ -310,6 +310,19 @@ class DatabaseManager:
                     ON project_threads(project_slug);
                 """,
             ),
+            (
+                5,
+                """
+                -- Link scheduled jobs to a project thread so cron deliveries
+                -- can be routed to a specific forum topic instead of a DM.
+                -- Resolution is done at load time via JOIN on project_threads(project_slug).
+                -- Jobs without a project_slug fall back to target_chat_ids (DM or plain chat).
+                ALTER TABLE scheduled_jobs ADD COLUMN project_slug TEXT;
+
+                CREATE INDEX IF NOT EXISTS idx_scheduled_jobs_project_slug
+                    ON scheduled_jobs(project_slug);
+                """,
+            ),
         ]
 
     async def _init_pool(self):

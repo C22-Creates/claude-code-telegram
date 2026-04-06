@@ -39,6 +39,8 @@ class ScheduledEvent(Event):
     working_directory: Path = field(default_factory=lambda: Path("."))
     target_chat_ids: List[int] = field(default_factory=list)
     skill_name: Optional[str] = None
+    project_slug: Optional[str] = None
+    message_thread_id: Optional[int] = None
     source: str = "scheduler"
 
 
@@ -50,5 +52,6 @@ class AgentResponseEvent(Event):
     text: str = ""
     parse_mode: Optional[str] = "HTML"
     reply_to_message_id: Optional[int] = None
+    message_thread_id: Optional[int] = None
     source: str = "agent"
     originating_event_id: Optional[str] = None

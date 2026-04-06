@@ -101,3 +101,48 @@ class TestNotificationService:
         event = Event(source="test")
         await service.handle_response(event)
         assert service._send_queue.qsize() == 0
+
+    async def test_send_forwards_message_thread_id(
+        self, service: NotificationService, mock_bot: AsyncMock
+    ) -> None:
+        """When AgentResponseEvent has a message_thread_id, it is passed
+        to bot.send_message so the message lands in a supergroup topic."""
+        event = AgentResponseEvent(
+            chat_id=-1003895073557,
+            text="scheduled digest",
+            message_thread_id=20,
+        )
+        await service._rate_limited_send(-1003895073557, event)
+
+        mock_bot.send_message.assert_called_once()
+        kwargs = mock_bot.send_message.call_args.kwargs
+        assert kwargs["chat_id"] == -1003895073557
+        assert kwargs["message_thread_id"] == 20
+
+    async def test_send_omits_thread_id_when_none(
+        self, service: NotificationService, mock_bot: AsyncMock
+    ) -> None:
+        """DM deliveries (no thread id) must not pass message_thread_id=None
+        to Telegram, which would be rejected. The kwarg should simply be absent."""
+        event = AgentResponseEvent(chat_id=123, text="dm text")
+        await service._rate_limited_send(123, event)
+
+        mock_bot.send_message.assert_called_once()
+        kwargs = mock_bot.send_message.call_args.kwargs
+        assert "message_thread_id" not in kwargs
+
+    async def test_long_message_keeps_thread_id_on_every_chunk(
+        self, service: NotificationService, mock_bot: AsyncMock
+    ) -> None:
+        """Multi-chunk deliveries must target the same topic for every chunk."""
+        long_text = ("A" * 3000) + "\n\n" + ("B" * 3000)
+        event = AgentResponseEvent(
+            chat_id=-1003895073557,
+            text=long_text,
+            message_thread_id=20,
+        )
+        await service._rate_limited_send(-1003895073557, event)
+
+        assert mock_bot.send_message.call_count >= 2
+        for call in mock_bot.send_message.call_args_list:
+            assert call.kwargs["message_thread_id"] == 20
