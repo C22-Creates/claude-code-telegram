@@ -113,6 +113,7 @@ class AgentHandler:
                         AgentResponseEvent(
                             chat_id=chat_id,
                             text=response.content,
+                            message_thread_id=event.message_thread_id,
                             originating_event_id=event.id,
                         )
                     )
@@ -123,6 +124,7 @@ class AgentHandler:
                         AgentResponseEvent(
                             chat_id=0,
                             text=response.content,
+                            message_thread_id=event.message_thread_id,
                             originating_event_id=event.id,
                         )
                     )

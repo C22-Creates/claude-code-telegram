@@ -104,11 +104,16 @@ class NotificationService:
             text = event.text
             chunks = self._split_message(text)
 
+            send_kwargs: dict = {}
+            if event.message_thread_id is not None:
+                send_kwargs["message_thread_id"] = event.message_thread_id
+
             for chunk in chunks:
                 await self.bot.send_message(
                     chat_id=chat_id,
                     text=chunk,
                     parse_mode=(ParseMode.HTML if event.parse_mode == "HTML" else None),
+                    **send_kwargs,
                 )
                 self._last_send_per_chat[chat_id] = asyncio.get_event_loop().time()
 
@@ -121,6 +126,7 @@ class NotificationService:
                 chat_id=chat_id,
                 text_length=len(text),
                 chunks=len(chunks),
+                message_thread_id=event.message_thread_id,
                 originating_event=event.originating_event_id,
             )
         except TelegramError as e:
