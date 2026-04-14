@@ -1,10 +1,31 @@
+# Projects configuration for forum-topic routing.
+#
+# Each project maps to a forum topic in your Telegram supergroup and a working
+# directory for the Claude Agent SDK. The bot creates missing topics on
+# startup and records them in the project_threads table.
+#
+# Copy this file to projects.yaml and customize for your setup.
+# projects.yaml is gitignored and should be synced between machines via
+# syncthing or another mechanism if you run failover (not via git).
+#
+# `path` is relative to the bot user's home Projects/ directory (or can be
+# an absolute path). Use symlinks to point multiple slugs at the same
+# underlying repo for session isolation without duplicating the checkout.
+
 projects:
-  - slug: claude-code-telegram
-    name: Claude Code Telegram
-    path: claude-code-telegram-main
+  - slug: main
+    name: Main
+    path: my-os
     enabled: true
 
-  - slug: infra
-    name: Infrastructure
-    path: infrastructure
+  # Additional topics share the same repo via symlinks for session isolation.
+  # ln -s my-os my-os-journal; ln -s my-os my-os-work; etc.
+  - slug: journal
+    name: Journal
+    path: my-os-journal
+    enabled: true
+
+  - slug: work
+    name: Work
+    path: my-os-work
     enabled: true
