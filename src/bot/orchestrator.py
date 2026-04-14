@@ -10,7 +10,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import structlog
 from telegram import (
@@ -133,8 +133,27 @@ class MessageOrchestrator:
     def __init__(self, settings: Settings, deps: Dict[str, Any]):
         self.settings = settings
         self.deps = deps
-        self._active_requests: Dict[int, ActiveRequest] = {}
+        # Keyed by (user_id, chat_id, thread_id_or_0) so concurrent requests
+        # in different topics don't clobber each other's Stop handles.
+        self._active_requests: Dict[
+            Tuple[int, int, int], ActiveRequest
+        ] = {}
         self._known_commands: frozenset[str] = frozenset()
+
+    @staticmethod
+    def _active_key(
+        user_id: int, chat_id: int, thread_id: Optional[int]
+    ) -> Tuple[int, int, int]:
+        """Build the active-requests key for a (user, chat, topic) tuple."""
+        return (user_id, chat_id, thread_id or 0)
+
+    @staticmethod
+    def _active_key_from_update(update: Update, user_id: int) -> Tuple[int, int, int]:
+        """Build the active-requests key for the current update."""
+        chat = update.effective_chat
+        chat_id = chat.id if chat is not None else 0
+        thread_id = MessageOrchestrator._extract_message_thread_id(update) or 0
+        return (user_id, chat_id, thread_id)
 
     def _inject_deps(self, handler: Callable) -> Callable:  # type: ignore[type-arg]
         """Wrap handler to inject dependencies into context.bot_data."""
@@ -940,8 +959,12 @@ class MessageOrchestrator:
 
         # Create Stop button and interrupt event
         interrupt_event = asyncio.Event()
+        active_key = self._active_key_from_update(update, user_id)
         stop_kb = InlineKeyboardMarkup(
-            [[InlineKeyboardButton("Stop", callback_data=f"stop:{user_id}")]]
+            [[InlineKeyboardButton(
+                "Stop",
+                callback_data=f"stop:{active_key[0]}:{active_key[1]}:{active_key[2]}",
+            )]]
         )
         progress_msg = await update.message.reply_text(
             "Working...", reply_markup=stop_kb
@@ -953,11 +976,11 @@ class MessageOrchestrator:
             interrupt_event=interrupt_event,
             progress_msg=progress_msg,
         )
-        self._active_requests[user_id] = active_request
+        self._active_requests[active_key] = active_request
 
         claude_integration = context.bot_data.get("claude_integration")
         if not claude_integration:
-            self._active_requests.pop(user_id, None)
+            self._active_requests.pop(active_key, None)
             await progress_msg.edit_text(
                 "Claude integration not available. Check configuration.",
                 reply_markup=None,
@@ -1067,7 +1090,7 @@ class MessageOrchestrator:
             ]
         finally:
             heartbeat.cancel()
-            self._active_requests.pop(user_id, None)
+            self._active_requests.pop(active_key, None)
             if draft_streamer:
                 try:
                     await draft_streamer.flush()
@@ -1673,9 +1696,19 @@ class MessageOrchestrator:
     async def _handle_stop_callback(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
-        """Handle stop: callbacks — interrupt a running Claude request."""
+        """Handle stop: callbacks — interrupt a running Claude request.
+
+        Accepts two callback_data formats:
+        - ``stop:{user_id}:{chat_id}:{thread_id}`` — new per-topic format
+        - ``stop:{user_id}`` — legacy, for in-flight buttons from prior deploys
+        """
         query = update.callback_query
-        target_user_id = int(query.data.split(":", 1)[1])
+        parts = query.data.split(":")
+        try:
+            target_user_id = int(parts[1])
+        except (IndexError, ValueError):
+            await query.answer("Invalid stop request.", show_alert=False)
+            return
 
         # Only the requesting user can stop their own request
         if query.from_user.id != target_user_id:
@@ -1684,7 +1717,20 @@ class MessageOrchestrator:
             )
             return
 
-        active = self._active_requests.get(target_user_id)
+        active: Optional[ActiveRequest] = None
+        if len(parts) >= 4:
+            try:
+                active_key = (target_user_id, int(parts[2]), int(parts[3]))
+                active = self._active_requests.get(active_key)
+            except ValueError:
+                active = None
+        if active is None:
+            # Legacy fallback: match any in-flight request for this user
+            for key, req in self._active_requests.items():
+                if key[0] == target_user_id:
+                    active = req
+                    break
+
         if not active:
             await query.answer("Already completed.", show_alert=False)
             return

@@ -1,11 +1,42 @@
 """Telegram bot authentication middleware."""
 
 from datetime import UTC, datetime
-from typing import Any, Callable, Dict
+from typing import Any, Callable, Dict, Optional
 
 import structlog
 
 logger = structlog.get_logger()
+
+
+async def _is_first_ever_auth(
+    data: Dict[str, Any], user_id: int, username: Optional[str]
+) -> bool:
+    """Return True if this is the first time this user has ever authenticated.
+
+    Uses the persistent ``users`` table (written on first-ever auth) to
+    distinguish between a genuinely new user and a rehydration-after-restart.
+    The in-memory ``AuthenticationManager.sessions`` dict is not suitable for
+    this check because it is wiped on every process restart.
+
+    Fails open: if storage is unavailable or the check raises, we treat this
+    as a first-time auth (show the banner) rather than silently drop it.
+    """
+    storage = data.get("storage")
+    if storage is None:
+        return True
+    try:
+        existing = await storage.users.get_user(user_id)
+        if existing is None:
+            await storage.get_or_create_user(user_id, username=username)
+            return True
+        return False
+    except Exception as exc:  # noqa: BLE001 - log and fail open
+        logger.warning(
+            "first_ever_auth storage check failed; showing banner",
+            user_id=user_id,
+            error=str(exc),
+        )
+        return True
 
 
 async def auth_middleware(handler: Callable, event: Any, data: Dict[str, Any]) -> Any:
@@ -82,8 +113,14 @@ async def auth_middleware(handler: Callable, event: Any, data: Dict[str, Any]) -
             auth_provider=session.auth_provider if session else None,
         )
 
-        # Welcome message for new session
-        if event.effective_message:
+        # Show welcome banner only on first-ever authentication for this user,
+        # not on every process restart. Since AuthenticationManager.sessions is
+        # an in-memory dict, it gets wiped whenever the bot restarts — which
+        # would otherwise spam the welcome message mid-conversation every time
+        # systemd respawns the process or we deploy.
+        is_first_ever = await _is_first_ever_auth(data, user_id, username)
+
+        if is_first_ever and event.effective_message:
             await event.effective_message.reply_text(
                 f"🔓 Welcome! You are now authenticated.\n"
                 f"Session started at {datetime.now(UTC).strftime('%H:%M:%S UTC')}"

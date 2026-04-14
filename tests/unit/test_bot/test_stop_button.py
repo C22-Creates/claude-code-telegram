@@ -80,7 +80,7 @@ class TestStopCallback:
         active = ActiveRequest(
             user_id=100, interrupt_event=event, progress_msg=progress_msg
         )
-        orchestrator._active_requests[100] = active
+        orchestrator._active_requests[(100, 0, 0)] = active
 
         query = AsyncMock()
         query.data = "stop:100"
@@ -108,7 +108,7 @@ class TestStopCallback:
         active = ActiveRequest(
             user_id=100, interrupt_event=event, progress_msg=AsyncMock()
         )
-        orchestrator._active_requests[100] = active
+        orchestrator._active_requests[(100, 0, 0)] = active
 
         query = AsyncMock()
         query.data = "stop:100"
@@ -152,7 +152,7 @@ class TestStopCallback:
             user_id=100, interrupt_event=event, progress_msg=AsyncMock()
         )
         active.interrupted = True  # already stopped once
-        orchestrator._active_requests[100] = active
+        orchestrator._active_requests[(100, 0, 0)] = active
 
         query = AsyncMock()
         query.data = "stop:100"
@@ -167,6 +167,59 @@ class TestStopCallback:
         await orchestrator._handle_stop_callback(update, context)
 
         query.answer.assert_awaited_once_with("Already stopping...", show_alert=False)
+
+    async def test_stop_routes_to_correct_topic(self, orchestrator):
+        """Stop button in topic A must not interrupt a request in topic B."""
+        ev_a = asyncio.Event()
+        ev_b = asyncio.Event()
+        active_a = ActiveRequest(
+            user_id=100, interrupt_event=ev_a, progress_msg=AsyncMock()
+        )
+        active_b = ActiveRequest(
+            user_id=100, interrupt_event=ev_b, progress_msg=AsyncMock()
+        )
+        # Same user, two topics
+        orchestrator._active_requests[(100, -1000, 10)] = active_a
+        orchestrator._active_requests[(100, -1000, 20)] = active_b
+
+        # Carl presses Stop on the topic-10 message
+        query = AsyncMock()
+        query.data = "stop:100:-1000:10"
+        query.from_user = MagicMock()
+        query.from_user.id = 100
+        update = MagicMock()
+        update.callback_query = query
+        context = MagicMock()
+        context.bot_data = {}
+
+        await orchestrator._handle_stop_callback(update, context)
+
+        assert ev_a.is_set(), "topic-10 request should be interrupted"
+        assert not ev_b.is_set(), "topic-20 request must NOT be interrupted"
+        assert active_a.interrupted is True
+        assert active_b.interrupted is False
+
+    async def test_legacy_stop_format_falls_back(self, orchestrator):
+        """Old `stop:{user_id}` buttons from pre-deploy messages still work."""
+        event = asyncio.Event()
+        active = ActiveRequest(
+            user_id=100, interrupt_event=event, progress_msg=AsyncMock()
+        )
+        orchestrator._active_requests[(100, -1000, 10)] = active
+
+        query = AsyncMock()
+        query.data = "stop:100"  # legacy format
+        query.from_user = MagicMock()
+        query.from_user.id = 100
+        update = MagicMock()
+        update.callback_query = query
+        context = MagicMock()
+        context.bot_data = {}
+
+        await orchestrator._handle_stop_callback(update, context)
+
+        assert event.is_set()
+        assert active.interrupted is True
 
 
 class TestStopButtonOnProgress:
@@ -231,7 +284,8 @@ class TestStopButtonOnProgress:
         assert isinstance(reply_markup, InlineKeyboardMarkup)
         button = reply_markup.inline_keyboard[0][0]
         assert button.text == "Stop"
-        assert button.callback_data == f"stop:{user_id}"
+        # New per-topic format: stop:{user_id}:{chat_id}:{thread_id}
+        assert button.callback_data.startswith(f"stop:{user_id}:")
 
     async def test_active_request_cleaned_up_after_success(
         self, orchestrator, settings

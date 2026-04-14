@@ -208,6 +208,110 @@ class TestMiddlewareBlocksSubsequentGroups:
         assert "settings" in captured_data
 
 
+class TestAuthMiddlewareWelcomeBanner:
+    """Verify the welcome banner fires only on first-ever auth.
+
+    Before this change, ``auth_middleware`` emitted the ``🔓 Welcome!`` banner
+    every time ``AuthenticationManager.sessions`` (in-memory dict) didn't have
+    the user — which meant every process restart caused a spurious banner
+    mid-conversation. The banner must now gate on persistent storage.
+    """
+
+    async def test_banner_shown_for_first_time_user(
+        self, bot, mock_update, mock_context
+    ):
+        from src.bot.middleware.auth import auth_middleware
+
+        auth_manager = MagicMock()
+        auth_manager.is_authenticated.return_value = False
+        auth_manager.authenticate_user = AsyncMock(return_value=True)
+        auth_manager.get_session.return_value = MagicMock(auth_provider="whitelist")
+        bot.deps["auth_manager"] = auth_manager
+
+        storage = MagicMock()
+        storage.users.get_user = AsyncMock(return_value=None)
+        storage.get_or_create_user = AsyncMock()
+        bot.deps["storage"] = storage
+
+        bot.deps["audit_logger"] = AsyncMock()
+
+        wrapper = bot._create_middleware_handler(auth_middleware)
+        await wrapper(mock_update, mock_context)
+
+        storage.users.get_user.assert_awaited_once_with(mock_update.effective_user.id)
+        storage.get_or_create_user.assert_awaited_once()
+        mock_update.effective_message.reply_text.assert_called_once()
+        assert "Welcome" in mock_update.effective_message.reply_text.call_args[0][0]
+
+    async def test_banner_suppressed_on_rehydration(
+        self, bot, mock_update, mock_context
+    ):
+        """Auth succeeds but user already exists in DB — no banner."""
+        from src.bot.middleware.auth import auth_middleware
+
+        auth_manager = MagicMock()
+        auth_manager.is_authenticated.return_value = False
+        auth_manager.authenticate_user = AsyncMock(return_value=True)
+        auth_manager.get_session.return_value = MagicMock(auth_provider="whitelist")
+        bot.deps["auth_manager"] = auth_manager
+
+        storage = MagicMock()
+        existing_user = MagicMock()
+        storage.users.get_user = AsyncMock(return_value=existing_user)
+        storage.get_or_create_user = AsyncMock()
+        bot.deps["storage"] = storage
+
+        bot.deps["audit_logger"] = AsyncMock()
+
+        wrapper = bot._create_middleware_handler(auth_middleware)
+        await wrapper(mock_update, mock_context)
+
+        storage.users.get_user.assert_awaited_once_with(mock_update.effective_user.id)
+        storage.get_or_create_user.assert_not_awaited()
+        mock_update.effective_message.reply_text.assert_not_called()
+
+    async def test_banner_failopens_when_storage_unavailable(
+        self, bot, mock_update, mock_context
+    ):
+        """Storage missing from deps — show banner rather than silently drop."""
+        from src.bot.middleware.auth import auth_middleware
+
+        auth_manager = MagicMock()
+        auth_manager.is_authenticated.return_value = False
+        auth_manager.authenticate_user = AsyncMock(return_value=True)
+        auth_manager.get_session.return_value = MagicMock(auth_provider="whitelist")
+        bot.deps["auth_manager"] = auth_manager
+        bot.deps.pop("storage", None)
+        bot.deps["audit_logger"] = AsyncMock()
+
+        wrapper = bot._create_middleware_handler(auth_middleware)
+        await wrapper(mock_update, mock_context)
+
+        mock_update.effective_message.reply_text.assert_called_once()
+
+    async def test_banner_failopens_when_storage_raises(
+        self, bot, mock_update, mock_context
+    ):
+        """Storage get_user raises — show banner rather than silently drop."""
+        from src.bot.middleware.auth import auth_middleware
+
+        auth_manager = MagicMock()
+        auth_manager.is_authenticated.return_value = False
+        auth_manager.authenticate_user = AsyncMock(return_value=True)
+        auth_manager.get_session.return_value = MagicMock(auth_provider="whitelist")
+        bot.deps["auth_manager"] = auth_manager
+
+        storage = MagicMock()
+        storage.users.get_user = AsyncMock(side_effect=RuntimeError("db down"))
+        bot.deps["storage"] = storage
+        bot.deps["audit_logger"] = AsyncMock()
+
+        wrapper = bot._create_middleware_handler(auth_middleware)
+        await wrapper(mock_update, mock_context)
+
+        mock_update.effective_message.reply_text.assert_called_once()
+
+
 @pytest.mark.asyncio
 async def test_middleware_wrapper_stops_bot_originated_updates() -> None:
     """Middleware wrapper should stop updates sent by bot users."""

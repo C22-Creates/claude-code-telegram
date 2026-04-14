@@ -1,0 +1,41 @@
+[Unit]
+Description=c22os Telegram Bot — autonomous scheduled task execution
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=c22bot
+Group=c22bot
+WorkingDirectory=/home/c22bot/c22os-telegram
+ExecStart=/home/c22bot/c22os-telegram/.venv/bin/python -m src.main
+Environment=TZ=America/New_York
+
+# Restart policy
+#   on-failure: don't auto-respawn when we deliberately `systemctl stop`.
+#   RestartSec gives a cool-down that prevents rapid restart loops when the
+#   process is crashing on startup (e.g. bad migration, missing env).
+Restart=on-failure
+RestartSec=30
+
+# Graceful shutdown cap. Default TimeoutStopSec is 90s, which was observed
+# masking in-flight Claude commands that held the event loop until SIGKILL.
+# 30s is enough for our shutdown handler to close storage, flush logs, and
+# cancel the event bus; anything still in flight loses, which is correct
+# for a process that's been told to stop.
+TimeoutStopSec=30
+KillSignal=SIGTERM
+
+# Memory safety. The Claude Agent SDK + MCP stdio servers have been
+# observed peaking at ~1.1G on this VPS; we set soft/hard caps so a
+# runaway process gets OOM-killed by the cgroup before it hoses the box.
+MemoryHigh=3G
+MemoryMax=4G
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=c22os-telegram
+
+[Install]
+WantedBy=multi-user.target
