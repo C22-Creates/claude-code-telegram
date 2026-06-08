@@ -136,6 +136,13 @@ class DispatcherService:
                 break
             run_count += 1
             await self._run_task(task)
+
+        # Fan-in (piece 4): settle parent tasks whose children have all
+        # finished, and send one consolidated completion per parent.
+        settle = getattr(self._board, "settle_parents", None)
+        if callable(settle):
+            for parent in settle():
+                await self._notify_parent_settled(parent)
         return run_count
 
     # ------------------------------------------------------------------ run task
@@ -206,6 +213,10 @@ class DispatcherService:
         status = final["status"]
         chat_id, thread_id = self._target(task)
         title = task.get("title", "task")
+        # Children of a fanned-out parent roll up into the parent's consolidated
+        # completion — their individual done/failed notifications are noise. A
+        # block always notifies, though, or the parent could never settle.
+        is_child = bool(task.get("parent_id"))
 
         if status == BLOCKED:
             reason = final.get("block_reason") or "I need your input to continue."
@@ -220,12 +231,16 @@ class DispatcherService:
                 )
                 return
         elif status == DONE:
+            if is_child:
+                return
             text = (outcome.content if outcome and outcome.content else "") or (
                 self._result_content(final)
             )
             if not text:
                 return  # nothing worth sending (e.g. silent internal task)
         elif status == FAILED:
+            if is_child:
+                return
             text = (
                 f"⚠️ Task failed: {title}\n\n"
                 f"{final.get('error') or 'unknown error'}\n\n(task {task['id'][:8]})"
@@ -242,6 +257,37 @@ class DispatcherService:
                 chat_id=chat_id,
                 text=text,
                 parse_mode=None,  # reasons/errors may contain <, &, etc.
+                message_thread_id=thread_id,
+            )
+        )
+
+    async def _notify_parent_settled(self, parent: Dict[str, Any]) -> None:
+        """Send one consolidated completion for a fanned-out parent task."""
+        chat_id, thread_id = self._target(parent)
+        if chat_id is None:
+            return
+        result = parent.get("result") if isinstance(parent.get("result"), dict) else {}
+        counts = result.get("subtasks", {}) if isinstance(result, dict) else {}
+        total = counts.get("total", 0)
+        done = counts.get("done", 0)
+        failed = counts.get("failed", 0)
+        cancelled = counts.get("cancelled", 0)
+
+        summary = f"{done}/{total} subtasks complete"
+        if failed:
+            summary += f" · {failed} failed"
+        if cancelled:
+            summary += f" · {cancelled} cancelled"
+        lines = [f"✅ Done: {parent.get('title', 'task')}", summary]
+        for child in (result.get("children", []) if isinstance(result, dict) else []):
+            mark = {DONE: "✓", FAILED: "✗"}.get(child.get("status"), "–")
+            lines.append(f"{mark} {child.get('title', '')}")
+
+        await self._event_bus.publish(
+            AgentResponseEvent(
+                chat_id=chat_id,
+                text="\n".join(lines),
+                parse_mode=None,
                 message_thread_id=thread_id,
             )
         )

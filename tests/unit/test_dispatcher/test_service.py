@@ -37,13 +37,14 @@ class FakeBoard:
         self.reclaim_calls = 0
         self.heartbeats: List[str] = []
 
-    def add(self, *, title="t", assignee=None, chat_id=None, payload=None):
+    def add(self, *, title="t", assignee=None, chat_id=None, payload=None,
+            parent_id=None):
         self._seq += 1
         tid = f"task{self._seq}"
         self.tasks[tid] = {
             "id": tid, "title": title, "status": PENDING, "assignee": assignee,
             "chat_id": chat_id, "payload": payload, "result": None,
-            "error": None, "block_reason": None,
+            "error": None, "block_reason": None, "parent_id": parent_id,
         }
         return tid
 
@@ -266,6 +267,47 @@ class DispatcherTest(unittest.IsolatedAsyncioTestCase):
         await d.stop()
         self.assertEqual(list(board.tasks.values())[0]["status"], DONE)
 
+    # ------------------------------------------------------- fan-in (piece 4)
+    async def test_child_done_notification_suppressed(self):
+        board = FakeBoard()
+        board.add(title="child", chat_id="5", parent_id="parent1")
+        bus = FakeEventBus()
+        d = make_dispatcher(board, FakeRunner(lambda t: RunOutcome(content="x")), bus)
+        await d.tick()
+        self.assertEqual(list(board.tasks.values())[0]["status"], DONE)
+        self.assertEqual(bus.published, [])  # rolls up into the parent
+
+    async def test_child_block_still_notifies(self):
+        board = FakeBoard()
+        board.add(title="child", chat_id="5", parent_id="parent1")
+        runner = FakeRunner(lambda t: RunOutcome(blocked=True, block_reason="?"))
+        bus = FakeEventBus()
+        d = make_dispatcher(board, runner, bus)
+        await d.tick()
+        self.assertEqual(len(bus.published), 1)  # block always reaches the human
+
+    async def test_notify_parent_settled_formats_summary(self):
+        bus = FakeEventBus()
+        d = make_dispatcher(FakeBoard(), FakeRunner(), bus)
+        parent = {
+            "id": "p1", "title": "Prep for ITI", "chat_id": "321", "payload": None,
+            "result": {
+                "subtasks": {"total": 3, "done": 2, "failed": 1, "cancelled": 0},
+                "children": [
+                    {"id": "a", "title": "Enrich Nicole", "status": DONE},
+                    {"id": "b", "title": "Draft email", "status": DONE},
+                    {"id": "c", "title": "Book room", "status": FAILED},
+                ],
+            },
+        }
+        await d._notify_parent_settled(parent)
+        self.assertEqual(len(bus.published), 1)
+        text = bus.published[0].text
+        self.assertIn("✅ Done: Prep for ITI", text)
+        self.assertIn("2/3 subtasks complete · 1 failed", text)
+        self.assertIn("✓ Enrich Nicole", text)
+        self.assertIn("✗ Book room", text)
+
 
 # ----------------------------------------------------- integration (real board)
 C22OS_HERMES = Path("/home/c22bot/Projects/c22os/hermes")
@@ -303,6 +345,26 @@ class RealBoardIntegrationTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stats["done"], 1)
         self.assertEqual(bus.published[0].text, "processed")
         self.assertEqual(bus.published[0].chat_id, 321)
+
+    async def test_fan_in_settles_parent_and_notifies(self):
+        res = self.board.create_with_subtasks(
+            "Prep for ITI follow-ups",
+            [{"title": "Enrich Nicole"}, {"title": "Draft intro email"}],
+            chat_id="321")
+        parent_id = res["parent"]["id"]
+        runner = FakeRunner(lambda t: RunOutcome(content="ok"))
+        bus = FakeEventBus()
+        d = make_dispatcher(self.board, runner, bus)
+
+        await d.tick()  # claims+runs both children, then settles the parent
+
+        self.assertEqual(self.board.get(parent_id)["status"], "done")
+        parent_msgs = [e for e in bus.published
+                       if e.text.startswith("✅ Done: Prep for ITI")]
+        self.assertEqual(len(parent_msgs), 1)
+        self.assertIn("2/2 subtasks complete", parent_msgs[0].text)
+        # Children rolled up — no individual child completion messages.
+        self.assertEqual(len(bus.published), 1)
 
     async def test_real_board_block_then_resume(self):
         tid = self.board.create("needs-human", chat_id="1")["id"]
