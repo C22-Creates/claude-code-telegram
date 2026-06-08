@@ -216,6 +216,7 @@ async def run_application(app: Dict[str, Any]) -> None:
 
     notification_service: Optional[NotificationService] = None
     scheduler: Optional[JobScheduler] = None
+    dispatcher: Optional[Any] = None
     project_threads_manager: Optional[ProjectThreadManager] = None
 
     # Set up signal handlers for graceful shutdown
@@ -316,6 +317,38 @@ async def run_application(app: Dict[str, Any]) -> None:
             await scheduler.start()
             logger.info("Job scheduler enabled")
 
+        # Hermes task-board dispatcher (if enabled)
+        if features.dispatcher_enabled:
+            from src.dispatcher.board_client import load_task_board
+            from src.dispatcher.runner import ClaudeTaskRunner
+            from src.dispatcher.service import DispatcherService
+
+            board = load_task_board(config.hermes_path, config.hermes_board_db)
+            task_runner = ClaudeTaskRunner(
+                claude_integration=claude_integration,
+                default_working_directory=config.approved_directory,
+                board_db_path=config.hermes_board_db,
+                hermes_cli_path=config.hermes_path / "cli.py",
+                default_user_id=(
+                    config.allowed_users[0] if config.allowed_users else 0
+                ),
+            )
+            dispatcher = DispatcherService(
+                board=board,
+                runner=task_runner,
+                event_bus=event_bus,
+                tick_seconds=config.dispatcher_tick_seconds,
+                stale_seconds=config.dispatcher_stale_seconds,
+                max_per_tick=config.dispatcher_max_per_tick,
+                heartbeat_seconds=config.dispatcher_heartbeat_seconds,
+            )
+            await dispatcher.start()
+            logger.info(
+                "Hermes dispatcher enabled",
+                board_db=str(config.hermes_board_db),
+                tick_seconds=config.dispatcher_tick_seconds,
+            )
+
         # Shutdown task
         shutdown_task = asyncio.create_task(shutdown_event.wait())
         tasks.append(shutdown_task)
@@ -352,6 +385,8 @@ async def run_application(app: Dict[str, Any]) -> None:
         logger.info("Shutting down application")
 
         try:
+            if dispatcher:
+                await dispatcher.stop()
             if scheduler:
                 await scheduler.stop()
             if notification_service:

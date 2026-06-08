@@ -299,6 +299,34 @@ class Settings(BaseSettings):
     enable_api_server: bool = Field(False, description="Enable FastAPI webhook server")
     api_server_port: int = Field(8080, description="Webhook API server port")
     enable_scheduler: bool = Field(False, description="Enable job scheduler")
+
+    # Hermes task-board dispatcher (off by default; see src/dispatcher/)
+    enable_dispatcher: bool = Field(
+        False, description="Enable the Hermes task-board dispatcher loop"
+    )
+    hermes_path: Path = Field(
+        Path("/home/c22bot/Projects/c22os/hermes"),
+        description="Directory containing the Hermes board package (board.py, cli.py)",
+    )
+    hermes_board_db: Path = Field(
+        Path("/home/c22bot/Projects/c22os/hermes/board.db"),
+        description="Path to the Hermes task-board SQLite database",
+    )
+    dispatcher_tick_seconds: int = Field(
+        60, description="Dispatcher poll interval in seconds", ge=5
+    )
+    dispatcher_stale_seconds: int = Field(
+        600,
+        description="Heartbeat age (seconds) before a claimed task is reclaimed",
+        ge=30,
+    )
+    dispatcher_max_per_tick: int = Field(
+        10, description="Max tasks drained per dispatcher tick", ge=1
+    )
+    dispatcher_heartbeat_seconds: int = Field(
+        120, description="Interval (seconds) for heartbeating in-flight tasks", ge=10
+    )
+
     github_webhook_secret: Optional[str] = Field(
         None, description="GitHub webhook HMAC secret"
     )
