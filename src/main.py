@@ -324,6 +324,14 @@ async def run_application(app: Dict[str, Any]) -> None:
             from src.dispatcher.service import DispatcherService
 
             board = load_task_board(config.hermes_path, config.hermes_board_db)
+
+            # Resume bridge: inbound Telegram replies that answer a blocked
+            # task resume it (piece 3). Registered into bot.deps so the message
+            # handler can reach it via context.bot_data.
+            from src.dispatcher.resume_bridge import ResumeBridge
+
+            bot.deps["resume_bridge"] = ResumeBridge(board)
+
             task_runner = ClaudeTaskRunner(
                 claude_integration=claude_integration,
                 default_working_directory=config.approved_directory,
