@@ -67,6 +67,11 @@ class FeatureFlags:
         return self.settings.enable_scheduler
 
     @property
+    def dispatcher_enabled(self) -> bool:
+        """Check if the Hermes task-board dispatcher is enabled."""
+        return self.settings.enable_dispatcher
+
+    @property
     def agentic_mode_enabled(self) -> bool:
         """Check if agentic conversational mode is enabled."""
         return self.settings.agentic_mode
@@ -100,6 +105,7 @@ class FeatureFlags:
             "development": self.development_features_enabled,
             "api_server": self.api_server_enabled,
             "scheduler": self.scheduler_enabled,
+            "dispatcher": self.dispatcher_enabled,
             "agentic_mode": self.agentic_mode_enabled,
             "voice_messages": self.voice_messages_enabled,
             "stream_drafts": self.stream_drafts_enabled,
@@ -129,6 +135,8 @@ class FeatureFlags:
             features.append("api_server")
         if self.scheduler_enabled:
             features.append("scheduler")
+        if self.dispatcher_enabled:
+            features.append("dispatcher")
         if self.voice_messages_enabled:
             features.append("voice_messages")
         if self.stream_drafts_enabled:

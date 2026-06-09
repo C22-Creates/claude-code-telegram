@@ -301,6 +301,12 @@ async def handle_text_message(
     message_text = update.message.text
     settings: Settings = context.bot_data["settings"]
 
+    # Hermes resume bridge: if this message answers a blocked task, resume it
+    # and stop. No-op when the dispatcher (and thus the bridge) is disabled.
+    resume_bridge = context.bot_data.get("resume_bridge")
+    if resume_bridge is not None and await resume_bridge.try_resume(update):
+        return
+
     # Get services
     rate_limiter: Optional[RateLimiter] = context.bot_data.get("rate_limiter")
     audit_logger: Optional[AuditLogger] = context.bot_data.get("audit_logger")
