@@ -261,11 +261,19 @@ class ClaudeSDKManager:
     def _is_retryable_error(self, exc: BaseException) -> bool:
         """Return True for transient errors that warrant a retry.
         asyncio.TimeoutError is intentional (user-configured timeout) — not retried.
-        Only non-MCP CLIConnectionError is considered transient.
+        Non-MCP CLIConnectionError and control-protocol handshake timeouts are
+        considered transient.
         """
         if isinstance(exc, CLIConnectionError):
             msg = str(exc).lower()
             return "mcp" not in msg  # "server" alone is too broad
+        # claude-agent-sdk raises a bare Exception when the control-protocol
+        # handshake times out (e.g. "Control request timeout: initialize").
+        # This is a transient subprocess startup failure — not a user-configured
+        # limit — so it is safe to retry. Match on the exact bare Exception type
+        # plus message to avoid retrying unrelated programming errors.
+        if type(exc) is Exception:
+            return "control request timeout" in str(exc).lower()
         return False
 
     async def execute_command(
@@ -499,6 +507,21 @@ class ClaudeSDKManager:
                         last_exc = exc
                         logger.warning(
                             "Transient connection error, will retry",
+                            attempt=attempt + 1,
+                            error=str(exc),
+                        )
+                        continue
+                    raise  # non-retryable or attempts exhausted
+                except Exception as exc:  # noqa: BLE001
+                    # Catches transient control-protocol handshake timeouts
+                    # ("Control request timeout: initialize") that the SDK raises
+                    # as a bare Exception. Only retried when _is_retryable_error
+                    # matches; every other exception re-raises immediately, which
+                    # preserves the prior behaviour.
+                    if self._is_retryable_error(exc) and attempt < max_attempts - 1:
+                        last_exc = exc
+                        logger.warning(
+                            "Transient SDK error, will retry",
                             attempt=attempt + 1,
                             error=str(exc),
                         )
