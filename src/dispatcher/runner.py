@@ -8,7 +8,7 @@ a human — the dispatcher reconciles against live board state afterward.
 
 import json
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import structlog
 
@@ -16,6 +16,40 @@ from ..claude.facade import ClaudeIntegration
 from .service import RunOutcome
 
 logger = structlog.get_logger()
+
+# Role-based model routing for Hermes tasks. A task's payload.role signals how
+# much judgment the work needs: pure discovery/filtering against a ledger
+# (e.g. hermes-recap-runner.md's "sweep" role) is routine and cheap; synthesis,
+# classification, and drafting (e.g. its "recap" role) is where mistakes are
+# expensive and worth a stronger model. payload.model, if set, always wins --
+# this table is only the default for tasks that don't specify one explicitly.
+FAST_MODEL = "claude-haiku-4-5-20251001"
+JUDGMENT_MODEL = "claude-fable-5"
+
+ROLE_MODEL_DEFAULTS: Dict[str, str] = {
+    "sweep": FAST_MODEL,
+    "recap": JUDGMENT_MODEL,
+}
+
+
+def resolve_model(task: Dict[str, Any]) -> Optional[str]:
+    """Pick a model override for a task, or None to use the SDK's configured default.
+
+    Priority: explicit payload.model > payload.role lookup in
+    ROLE_MODEL_DEFAULTS > None (no override; caller's default model config
+    applies unchanged -- this keeps every task type this routing table
+    doesn't know about behaving exactly as it did before this feature).
+    """
+    payload = task.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    explicit = payload.get("model")
+    if explicit:
+        return str(explicit)
+    role = payload.get("role")
+    if role in ROLE_MODEL_DEFAULTS:
+        return ROLE_MODEL_DEFAULTS[role]
+    return None
 
 
 class ClaudeTaskRunner:
@@ -38,12 +72,16 @@ class ClaudeTaskRunner:
     async def run(self, task: Dict[str, Any]) -> RunOutcome:
         prompt = self._build_prompt(task)
         working_dir = self._working_directory(task)
+        model = resolve_model(task)
+        if model:
+            logger.info("Model override for task", task_id=task["id"], model=model)
 
         response = await self._claude.run_command(
             prompt=prompt,
             working_directory=working_dir,
             user_id=self._default_user_id,
             force_new=True,  # each task is an independent unit of work
+            model=model,
         )
 
         if getattr(response, "is_error", False):
