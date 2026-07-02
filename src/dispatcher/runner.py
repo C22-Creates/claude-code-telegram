@@ -17,28 +17,40 @@ from .service import RunOutcome
 
 logger = structlog.get_logger()
 
-# Role-based model routing for Hermes tasks. A task's payload.role signals how
-# much judgment the work needs: pure discovery/filtering against a ledger
-# (e.g. hermes-recap-runner.md's "sweep" role) is routine and cheap; synthesis,
-# classification, and drafting (e.g. its "recap" role) is where mistakes are
-# expensive and worth a stronger model. payload.model, if set, always wins --
-# this table is only the default for tasks that don't specify one explicitly.
+# Model routing for Hermes tasks, keyed by (runner doc, role). Role names are
+# NOT unique across runners -- "sweep" is routine ledger-filtering in the recap
+# runner but includes drafting in the pipeline runner -- so a bare-role table
+# would misroute. Every dispatched task payload carries both `runner_doc` and
+# `role` (verified against live board data 2026-07-02); tasks missing either
+# get no override. payload.model, if set, always wins over this table.
 FAST_MODEL = "claude-haiku-4-5-20251001"
 JUDGMENT_MODEL = "claude-fable-5"
 
-ROLE_MODEL_DEFAULTS: Dict[str, str] = {
-    "sweep": FAST_MODEL,
-    "recap": JUDGMENT_MODEL,
+RUNNER_ROLE_MODELS: Dict[tuple, str] = {
+    # recap loop: discovery/filtering is routine; per-meeting synthesis,
+    # area classification, and drafting are judgment.
+    ("hermes-recap-runner.md", "sweep"): FAST_MODEL,
+    ("hermes-recap-runner.md", "recap"): JUDGMENT_MODEL,
+    # lead loop: ICP classification (Strong/Possible/Referral/Missing) IS the
+    # loop's core judgment, and a misfiled lead is expensive -- both roles get
+    # the judgment model. Revisit "write" (Phase 2, gated CRM writes) for a
+    # downshift only after it has run trusted for a while.
+    ("hermes-lead-runner.md", "digest"): JUDGMENT_MODEL,
+    ("hermes-lead-runner.md", "write"): JUDGMENT_MODEL,
+    # hermes-inbox-runner.md and hermes-pipeline-runner.md are intentionally
+    # unmapped: their "sweep" roles draft content inline, so they keep the
+    # configured global model until each is profiled separately.
 }
 
 
 def resolve_model(task: Dict[str, Any]) -> Optional[str]:
     """Pick a model override for a task, or None to use the SDK's configured default.
 
-    Priority: explicit payload.model > payload.role lookup in
-    ROLE_MODEL_DEFAULTS > None (no override; caller's default model config
-    applies unchanged -- this keeps every task type this routing table
-    doesn't know about behaving exactly as it did before this feature).
+    Priority: explicit payload.model > (basename(payload.runner_doc),
+    payload.role) lookup in RUNNER_ROLE_MODELS > None (no override; caller's
+    default model config applies unchanged -- this keeps every task type this
+    routing table doesn't know about behaving exactly as it did before this
+    feature).
     """
     payload = task.get("payload")
     if not isinstance(payload, dict):
@@ -46,10 +58,12 @@ def resolve_model(task: Dict[str, Any]) -> Optional[str]:
     explicit = payload.get("model")
     if explicit:
         return str(explicit)
+    runner_doc = payload.get("runner_doc")
     role = payload.get("role")
-    if role in ROLE_MODEL_DEFAULTS:
-        return ROLE_MODEL_DEFAULTS[role]
-    return None
+    if not runner_doc or not role:
+        return None
+    key = (Path(str(runner_doc)).name, str(role))
+    return RUNNER_ROLE_MODELS.get(key)
 
 
 class ClaudeTaskRunner:
