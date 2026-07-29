@@ -1184,3 +1184,59 @@ class TestClaudeMdLoading:
 
         opts = captured[0]
         assert opts.setting_sources == ["project"]
+
+
+class TestAwaitCancelledBounded:
+    """Cancelling an SDK task must never hang the caller.
+
+    Regression guard for the 2026-07-29 incident: a wedged child process
+    swallowed cancellation, the bare `await run_task` in the cleanup path
+    never returned, and the orchestrator's `finally: heartbeat.cancel()`
+    therefore never ran — leaving the Telegram typing indicator on forever
+    and the child orphaned for 15.5 hours.
+    """
+
+    @staticmethod
+    async def _wedged_task(stop: asyncio.Event) -> None:
+        """A task that swallows cancellation, like a child stuck on a pipe read."""
+        while not stop.is_set():
+            try:
+                await asyncio.sleep(0.01)
+            except asyncio.CancelledError:
+                pass  # refuse to die — this is the failure mode under test
+
+    async def test_returns_false_and_does_not_hang_when_task_ignores_cancel(self):
+        stop = asyncio.Event()
+        task = asyncio.create_task(self._wedged_task(stop))
+        await asyncio.sleep(0)  # let it start
+
+        task.cancel()
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        settled = await ClaudeSDKManager._await_cancelled(
+            task, reason="test", timeout=0.05
+        )
+        elapsed = loop.time() - started
+
+        assert settled is False, "a wedged task must be reported as unsettled"
+        # The point of the fix: control returns on a bound, not never.
+        assert elapsed < 2.0, f"cleanup await was not bounded (took {elapsed:.2f}s)"
+
+        # Let the fixture task exit so it does not leak into other tests.
+        stop.set()
+        await asyncio.wait({task}, timeout=1.0)
+
+    async def test_returns_true_when_task_honors_cancellation(self):
+        async def _cooperative() -> None:
+            await asyncio.sleep(60)
+
+        task = asyncio.create_task(_cooperative())
+        await asyncio.sleep(0)
+        task.cancel()
+
+        settled = await ClaudeSDKManager._await_cancelled(
+            task, reason="test", timeout=1.0
+        )
+
+        assert settled is True
+        assert task.cancelled()

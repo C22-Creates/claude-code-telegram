@@ -45,6 +45,13 @@ logger = structlog.get_logger()
 # Fallback message when Claude produces no text but did use tools.
 TASK_COMPLETED_MSG = "✅ Task completed. Tools used: {tools_summary}"
 
+# How long to wait for an already-cancelled SDK task to actually settle before
+# abandoning it. Cancellation is not guaranteed to land — see
+# ClaudeSDKManager._await_cancelled for the failure mode this bounds. Kept
+# short: by this point the request has already failed, and the only thing left
+# to do is hand control back so the caller's cleanup can run.
+CANCELLED_TASK_CLEANUP_TIMEOUT = 10.0
+
 
 @dataclass
 class ClaudeResponse:
@@ -268,6 +275,44 @@ class ClaudeSDKManager:
             return "mcp" not in msg  # "server" alone is too broad
         return False
 
+    @staticmethod
+    async def _await_cancelled(
+        task: "asyncio.Task[None]",
+        reason: str,
+        timeout: float = CANCELLED_TASK_CLEANUP_TIMEOUT,
+    ) -> bool:
+        """Wait — with a hard bound — for an already-cancelled task to finish.
+
+        A bare ``await task`` after ``task.cancel()`` is NOT guaranteed to
+        return. If the SDK child process is wedged (blocked reading a stdout
+        pipe that never yields and never closes), the CancelledError is never
+        delivered at an await point and the await hangs forever.
+
+        That hang propagates all the way up. ``execute_command`` never
+        returns, so the orchestrator's ``finally: heartbeat.cancel()`` never
+        runs — leaving the Telegram typing indicator running forever while
+        the wedged child leaks. Observed 2026-07-29: the bot appeared
+        permanently "typing" and a 15.5h-old orphaned child held 220MB plus
+        its own MCP subprocesses. The 5-minute claude_timeout_seconds fired
+        correctly and did not help, because the hang was in the cleanup path
+        that runs *after* the timeout.
+
+        Returns True if the task settled, False if it is still wedged. A
+        False return is a leak we cannot fix from here, so it is logged at
+        error level — but we return control to the caller either way, which
+        is what stops the typing indicator and frees the request slot.
+        """
+        _, pending = await asyncio.wait({task}, timeout=timeout)
+        if pending:
+            logger.error(
+                "Cancelled SDK task did not settle; abandoning it to avoid "
+                "hanging the request. The child process may be orphaned.",
+                reason=reason,
+                timeout_seconds=timeout,
+            )
+            return False
+        return True
+
     async def execute_command(
         self,
         prompt: str,
@@ -481,18 +526,13 @@ class ClaudeSDKManager:
                 except asyncio.CancelledError:
                     if not interrupted:
                         raise
-                    # Interrupt cancelled the task — wait for cleanup
-                    try:
-                        await run_task
-                    except asyncio.CancelledError:
-                        pass
+                    # Interrupt cancelled the task — wait for cleanup, but do
+                    # not let a wedged child block the interrupt forever.
+                    await self._await_cancelled(run_task, reason="user_interrupt")
                     break  # user interrupted — don't retry
                 except asyncio.TimeoutError:
                     run_task.cancel()
-                    try:
-                        await run_task
-                    except asyncio.CancelledError:
-                        pass
+                    await self._await_cancelled(run_task, reason="claude_timeout")
                     raise  # timeout — don't retry
                 except CLIConnectionError as exc:
                     if self._is_retryable_error(exc) and attempt < max_attempts - 1:
