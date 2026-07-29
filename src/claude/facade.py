@@ -10,6 +10,7 @@ from typing import Any, Callable, Dict, List, Optional
 import structlog
 
 from ..config.settings import Settings
+from .exceptions import ClaudeTimeoutError
 from .sdk_integration import ClaudeResponse, ClaudeSDKManager, StreamUpdate
 from .session import SessionManager
 
@@ -29,6 +30,22 @@ class ClaudeIntegration:
         self.config = config
         self.sdk_manager = sdk_manager or ClaudeSDKManager(config)
         self.session_manager = session_manager
+        # One lock per conversation. Two messages arriving in the same topic
+        # while the first is still running used to spawn two SDK subprocesses
+        # against the same `--resume <id>`; one of them would wedge with no
+        # watchdog. Queueing the second message keeps the transcript linear.
+        self._conversation_locks: Dict[tuple, asyncio.Lock] = {}
+
+    def _conversation_lock(
+        self, user_id: int, working_directory: Path, scope_key: Optional[str]
+    ) -> asyncio.Lock:
+        """Get (or create) the lock serializing one conversation's turns."""
+        key = (user_id, str(working_directory), scope_key)
+        lock = self._conversation_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._conversation_locks[key] = lock
+        return lock
 
     async def run_command(
         self,
@@ -41,8 +58,37 @@ class ClaudeIntegration:
         interrupt_event: Optional["asyncio.Event"] = None,
         images: Optional[List[Dict[str, str]]] = None,
         model: Optional[str] = None,
+        scope_key: Optional[str] = None,
     ) -> ClaudeResponse:
         """Run Claude Code command with full integration."""
+        async with self._conversation_lock(user_id, working_directory, scope_key):
+            return await self._run_command_locked(
+                prompt=prompt,
+                working_directory=working_directory,
+                user_id=user_id,
+                session_id=session_id,
+                on_stream=on_stream,
+                force_new=force_new,
+                interrupt_event=interrupt_event,
+                images=images,
+                model=model,
+                scope_key=scope_key,
+            )
+
+    async def _run_command_locked(
+        self,
+        prompt: str,
+        working_directory: Path,
+        user_id: int,
+        session_id: Optional[str] = None,
+        on_stream: Optional[Callable[[StreamUpdate], None]] = None,
+        force_new: bool = False,
+        interrupt_event: Optional["asyncio.Event"] = None,
+        images: Optional[List[Dict[str, str]]] = None,
+        model: Optional[str] = None,
+        scope_key: Optional[str] = None,
+    ) -> ClaudeResponse:
+        """Run one command. Caller holds the conversation lock."""
         logger.info(
             "Running Claude command",
             user_id=user_id,
@@ -50,14 +96,15 @@ class ClaudeIntegration:
             session_id=session_id,
             prompt_length=len(prompt),
             force_new=force_new,
+            scope_key=scope_key,
         )
 
         # If no session_id provided, try to find an existing session for this
-        # user+directory combination (auto-resume).
+        # user+directory+scope combination (auto-resume).
         # Skip auto-resume when force_new is set (e.g. after /new command).
         if not session_id and not force_new:
             existing_session = await self._find_resumable_session(
-                user_id, working_directory
+                user_id, working_directory, scope_key
             )
             if existing_session:
                 session_id = existing_session.session_id
@@ -66,11 +113,12 @@ class ClaudeIntegration:
                     session_id=session_id,
                     project_path=str(working_directory),
                     user_id=user_id,
+                    scope_key=scope_key,
                 )
 
         # Get or create session
         session = await self.session_manager.get_or_create_session(
-            user_id, working_directory, session_id
+            user_id, working_directory, session_id, scope_key=scope_key
         )
 
         # Execute command
@@ -93,6 +141,18 @@ class ClaudeIntegration:
                     images=images,
                     model=model,
                 )
+            except ClaudeTimeoutError:
+                # A timeout says the turn was too slow — NOT that the session is
+                # gone. Discarding it here cost the user their whole thread and
+                # started them over cold on the next message. Keep the session
+                # intact so the conversation survives a slow turn.
+                logger.error(
+                    "Claude command timed out; session preserved for retry",
+                    session_id=session.session_id,
+                    user_id=user_id,
+                    scope_key=scope_key,
+                )
+                raise
             except Exception as resume_error:
                 # If resume failed (e.g., session expired/missing on Claude's side),
                 # retry as a fresh session.  The CLI returns a generic exit-code-1
@@ -108,7 +168,7 @@ class ClaudeIntegration:
 
                     # Create a fresh session and retry
                     session = await self.session_manager.get_or_create_session(
-                        user_id, working_directory
+                        user_id, working_directory, scope_key=scope_key
                     )
                     response = await self._execute(
                         prompt=prompt,
@@ -182,11 +242,16 @@ class ClaudeIntegration:
         self,
         user_id: int,
         working_directory: Path,
+        scope_key: Optional[str] = None,
     ) -> Optional["ClaudeSession"]:  # noqa: F821
         """Find the most recent resumable session for a user in a directory.
 
-        Returns the session if one exists that is non-expired and has a real
-        (non-temporary) session ID from Claude. Returns None otherwise.
+        Returns the session if one exists that is non-expired, belongs to the
+        same scope, and has a real (non-temporary) session ID from Claude.
+        Returns None otherwise.
+
+        The scope match is what stops one Telegram topic from resuming another
+        topic's conversation — or a background job's.
         """
 
         sessions = await self.session_manager._get_user_sessions(user_id)
@@ -195,6 +260,7 @@ class ClaudeIntegration:
             s
             for s in sessions
             if s.project_path == working_directory
+            and s.scope_key == scope_key
             and bool(s.session_id)
             and not s.is_expired(self.config.session_timeout_hours)
         ]
@@ -210,6 +276,7 @@ class ClaudeIntegration:
         working_directory: Path,
         prompt: Optional[str] = None,
         on_stream: Optional[Callable[[StreamUpdate], None]] = None,
+        scope_key: Optional[str] = None,
     ) -> Optional[ClaudeResponse]:
         """Continue the most recent session."""
         logger.info(
@@ -217,16 +284,20 @@ class ClaudeIntegration:
             user_id=user_id,
             working_directory=str(working_directory),
             has_prompt=bool(prompt),
+            scope_key=scope_key,
         )
 
         # Get user's sessions
         sessions = await self.session_manager._get_user_sessions(user_id)
 
-        # Find most recent session in this directory (exclude sessions without IDs)
+        # Find most recent session in this directory and scope (exclude
+        # sessions without IDs)
         matching_sessions = [
             s
             for s in sessions
-            if s.project_path == working_directory and bool(s.session_id)
+            if s.project_path == working_directory
+            and s.scope_key == scope_key
+            and bool(s.session_id)
         ]
 
         if not matching_sessions:
@@ -244,6 +315,7 @@ class ClaudeIntegration:
             user_id=user_id,
             session_id=latest_session.session_id,
             on_stream=on_stream,
+            scope_key=scope_key,
         )
 
     async def get_session_info(

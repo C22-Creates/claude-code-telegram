@@ -39,6 +39,7 @@ from .utils.image_extractor import (
     should_send_as_photo,
     validate_image_path,
 )
+from .utils.session_scope import scope_key_from_context
 
 logger = structlog.get_logger()
 
@@ -135,9 +136,7 @@ class MessageOrchestrator:
         self.deps = deps
         # Keyed by (user_id, chat_id, thread_id_or_0) so concurrent requests
         # in different topics don't clobber each other's Stop handles.
-        self._active_requests: Dict[
-            Tuple[int, int, int], ActiveRequest
-        ] = {}
+        self._active_requests: Dict[Tuple[int, int, int], ActiveRequest] = {}
         self._known_commands: frozenset[str] = frozenset()
 
     @staticmethod
@@ -961,10 +960,14 @@ class MessageOrchestrator:
         interrupt_event = asyncio.Event()
         active_key = self._active_key_from_update(update, user_id)
         stop_kb = InlineKeyboardMarkup(
-            [[InlineKeyboardButton(
-                "Stop",
-                callback_data=f"stop:{active_key[0]}:{active_key[1]}:{active_key[2]}",
-            )]]
+            [
+                [
+                    InlineKeyboardButton(
+                        "Stop",
+                        callback_data=f"stop:{active_key[0]}:{active_key[1]}:{active_key[2]}",
+                    )
+                ]
+            ]
         )
         progress_msg = await update.message.reply_text(
             "Working...", reply_markup=stop_kb
@@ -1033,6 +1036,7 @@ class MessageOrchestrator:
                 prompt=message_text,
                 working_directory=current_dir,
                 user_id=user_id,
+                scope_key=scope_key_from_context(context),
                 session_id=session_id,
                 on_stream=on_stream,
                 force_new=force_new,
@@ -1284,6 +1288,7 @@ class MessageOrchestrator:
                 prompt=prompt,
                 working_directory=current_dir,
                 user_id=user_id,
+                scope_key=scope_key_from_context(context),
                 session_id=session_id,
                 on_stream=on_stream,
                 force_new=force_new,
@@ -1493,6 +1498,7 @@ class MessageOrchestrator:
                 prompt=prompt,
                 working_directory=current_dir,
                 user_id=user_id,
+                scope_key=scope_key_from_context(context),
                 session_id=session_id,
                 on_stream=on_stream,
                 force_new=force_new,
@@ -1627,7 +1633,9 @@ class MessageOrchestrator:
             session_id = None
             if claude_integration:
                 existing = await claude_integration._find_resumable_session(
-                    update.effective_user.id, target_path
+                    update.effective_user.id,
+                    target_path,
+                    scope_key_from_context(context),
                 )
                 if existing:
                     session_id = existing.session_id
@@ -1774,7 +1782,7 @@ class MessageOrchestrator:
         session_id = None
         if claude_integration:
             existing = await claude_integration._find_resumable_session(
-                query.from_user.id, new_path
+                query.from_user.id, new_path, scope_key_from_context(context)
             )
             if existing:
                 session_id = existing.session_id

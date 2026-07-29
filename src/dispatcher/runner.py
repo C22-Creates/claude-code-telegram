@@ -13,6 +13,7 @@ from typing import Any, Dict, Optional
 import structlog
 
 from ..claude.facade import ClaudeIntegration
+from ..utils.constants import SCOPE_HERMES, SYSTEM_USER_ID
 from .service import RunOutcome
 
 logger = structlog.get_logger()
@@ -75,7 +76,7 @@ class ClaudeTaskRunner:
         default_working_directory: Path,
         board_db_path: Path,
         hermes_cli_path: Path,
-        default_user_id: int = 0,
+        default_user_id: int = SYSTEM_USER_ID,
     ) -> None:
         self._claude = claude_integration
         self._default_working_directory = default_working_directory
@@ -96,6 +97,11 @@ class ClaudeTaskRunner:
             user_id=self._default_user_id,
             force_new=True,  # each task is an independent unit of work
             model=model,
+            # Board tasks live in their own session scope, so their churn can
+            # never evict a conversation a human is still having. Task state is
+            # durable in board.db, not in the session, which is why force_new
+            # is correct here.
+            scope_key=SCOPE_HERMES,
         )
 
         if getattr(response, "is_error", False):
@@ -112,12 +118,10 @@ class ClaudeTaskRunner:
     def _build_prompt(self, task: Dict[str, Any]) -> str:
         task_id = task["id"]
         payload = task.get("payload")
-        payload_str = (
-            json.dumps(payload, indent=2) if payload is not None else "(none)"
-        )
+        payload_str = json.dumps(payload, indent=2) if payload is not None else "(none)"
         assignee = task.get("assignee") or "the appropriate specialist"
         block_cmd = (
-            f'python3 {self._hermes_cli_path} --db {self._board_db_path} '
+            f"python3 {self._hermes_cli_path} --db {self._board_db_path} "
             f'block {task_id} --reason "<your specific question>"'
         )
         return (
