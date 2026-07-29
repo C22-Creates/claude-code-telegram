@@ -10,7 +10,7 @@ from typing import List, Optional
 import structlog
 from telegram import Bot
 from telegram.constants import ParseMode
-from telegram.error import TelegramError
+from telegram.error import BadRequest, TelegramError
 
 from ..events.bus import Event, EventBus
 from ..events.types import AgentResponseEvent
@@ -108,13 +108,33 @@ class NotificationService:
             if event.message_thread_id is not None:
                 send_kwargs["message_thread_id"] = event.message_thread_id
 
+            parse_mode = ParseMode.HTML if event.parse_mode == "HTML" else None
             for chunk in chunks:
-                await self.bot.send_message(
-                    chat_id=chat_id,
-                    text=chunk,
-                    parse_mode=(ParseMode.HTML if event.parse_mode == "HTML" else None),
-                    **send_kwargs,
-                )
+                try:
+                    await self.bot.send_message(
+                        chat_id=chat_id,
+                        text=chunk,
+                        parse_mode=parse_mode,
+                        **send_kwargs,
+                    )
+                except BadRequest as e:
+                    # Telegram rejects malformed HTML (e.g. an unescaped
+                    # "<callback>" in agent output) with "Can't parse entities".
+                    # Rather than drop the notification entirely, resend the chunk
+                    # as plain text so the user still receives the content.
+                    if parse_mode is None or "parse" not in str(e).lower():
+                        raise
+                    logger.warning(
+                        "HTML parse failed, resending notification as plain text",
+                        chat_id=chat_id,
+                        error=str(e),
+                    )
+                    await self.bot.send_message(
+                        chat_id=chat_id,
+                        text=chunk,
+                        parse_mode=None,
+                        **send_kwargs,
+                    )
                 self._last_send_per_chat[chat_id] = asyncio.get_event_loop().time()
 
                 # Rate limit between chunks too

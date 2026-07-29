@@ -12,7 +12,18 @@ Matching, in priority order (never guesses):
   2. A `task <shortid>` / `task:<shortid>` marker typed in the reply itself.
   3. Exactly one blocked task for this (chat, topic) — the natural "just answer
      in the topic" path.
-Zero or multiple candidates with no marker => not a resume; fall through.
+  4. A bare affirmative ("go", "yes", "lgtm", ...) with multiple blocked
+     candidates and no marker => bulk-resume ALL of them with that note. This
+     exists because a sweep (e.g. the recap sweep) can block N tasks at once in
+     the same topic; Carl's natural reply is a single "go" meaning "yes to all
+     the proposed defaults," not "yes to an arbitrary one of them." Before this
+     rule, a plain "go" matched nothing (multiple candidates, no marker), fell
+     through to normal Claude routing, and the task stayed blocked — the next
+     sweep run then re-fanned-out a duplicate child for the same meeting,
+     compounding indefinitely (see workflows/hermes-recap-runner.md's "Gate
+     reply gotcha," 2026-06-29 / c22os audit 2026-07-02).
+Zero candidates, or multiple candidates with no marker and non-affirmative
+text => not a resume; fall through (still never guesses at a *specific* one).
 
 The board is duck-typed; only `list_tasks(status=...)` and `resume(id, note=)`
 are used. The bridge NEVER raises into the message handler.
@@ -29,6 +40,14 @@ BLOCKED = "blocked"
 
 # Matches the dispatcher's "(task abc12345)" marker, or "task: abc12345".
 _TASK_MARKER = re.compile(r"task[:\s]+([0-9a-fA-F]{6,32})")
+
+# Bare affirmatives that mean "yes, do everything you proposed" when there's
+# no marker to disambiguate. Deliberately short and unambiguous — anything
+# more specific ("file under Nevado, skip clickup") should target one task by
+# marker instead, since it can't apply identically to N different meetings.
+_BULK_AFFIRMATIVES = frozenset(
+    {"go", "yes", "yep", "yeah", "y", "lgtm", "sure", "ok", "okay", "approved", "proceed"}
+)
 
 
 class ResumeBridge:
@@ -56,21 +75,31 @@ class ResumeBridge:
             if not candidates:
                 return False
 
-            task = self._match(candidates, text, quoted)
-            if task is None:
+            tasks = self._match(candidates, text, quoted)
+            if not tasks:
                 return False
 
-            self._board.resume(task["id"], note=text)
-            logger.info(
-                "Resumed blocked task from reply",
-                task_id=task["id"],
-                chat_id=chat_id,
-                thread_id=thread_id,
-            )
+            for task in tasks:
+                self._board.resume(task["id"], note=text)
+                logger.info(
+                    "Resumed blocked task from reply",
+                    task_id=task["id"],
+                    chat_id=chat_id,
+                    thread_id=thread_id,
+                    bulk=len(tasks) > 1,
+                )
             try:
-                await message.reply_text(f"↩️ Resuming: {task.get('title', task['id'])}")
+                if len(tasks) == 1:
+                    await message.reply_text(
+                        f"↩️ Resuming: {tasks[0].get('title', tasks[0]['id'])}"
+                    )
+                else:
+                    titles = "\n".join(f"- {t.get('title', t['id'])}" for t in tasks)
+                    await message.reply_text(f"↩️ Resuming {len(tasks)} tasks:\n{titles}")
             except Exception:
-                logger.warning("Resume confirmation reply failed", task_id=task["id"])
+                logger.warning(
+                    "Resume confirmation reply failed", task_ids=[t["id"] for t in tasks]
+                )
             return True
         except Exception:
             logger.exception("Resume bridge error; falling through")
@@ -97,7 +126,7 @@ class ResumeBridge:
 
     def _match(
         self, candidates: List[Dict[str, Any]], text: str, quoted: str
-    ) -> Optional[Dict[str, Any]]:
+    ) -> List[Dict[str, Any]]:
         # 1 & 2: explicit task marker (prefer the quoted/reply-to source).
         for source in (quoted, text):
             match = _TASK_MARKER.search(source or "")
@@ -106,11 +135,19 @@ class ResumeBridge:
             short_id = match.group(1).lower()
             for task in candidates:
                 if task["id"].lower().startswith(short_id):
-                    return task
+                    return [task]
         # 3: unambiguous single blocked task in this chat/topic.
         if len(candidates) == 1:
-            return candidates[0]
-        return None
+            return [candidates[0]]
+        # 4: bare affirmative with multiple candidates => bulk-resume all.
+        if self._is_bulk_affirmative(text):
+            return list(candidates)
+        return []
+
+    @staticmethod
+    def _is_bulk_affirmative(text: str) -> bool:
+        normalized = text.strip().lower().rstrip("!.?")
+        return normalized in _BULK_AFFIRMATIVES
 
     @staticmethod
     def _as_int(value: Any) -> Optional[int]:

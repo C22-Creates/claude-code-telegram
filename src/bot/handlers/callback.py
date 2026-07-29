@@ -12,6 +12,7 @@ from ...config.settings import Settings
 from ...security.audit import AuditLogger
 from ...security.validators import SecurityValidator
 from ..utils.html_format import escape_html
+from ..utils.session_scope import scope_key_from_context
 
 logger = structlog.get_logger()
 
@@ -171,7 +172,7 @@ async def handle_cd_callback(
         resumed_session_info = ""
         if claude_integration:
             existing_session = await claude_integration._find_resumable_session(
-                user_id, new_path
+                user_id, new_path, scope_key_from_context(context)
             )
             if existing_session:
                 context.user_data["claude_session_id"] = existing_session.session_id
@@ -564,6 +565,7 @@ async def _handle_continue_action(query, context: ContextTypes.DEFAULT_TYPE) -> 
                 prompt="",  # Empty prompt triggers --continue
                 working_directory=current_dir,
                 user_id=user_id,
+                scope_key=scope_key_from_context(context),
                 session_id=claude_session_id,
             )
         else:
@@ -920,7 +922,10 @@ async def handle_quick_action_callback(
 
         # Run the action through Claude
         claude_response = await claude_integration.run_command(
-            prompt=action.prompt, working_directory=current_dir, user_id=user_id
+            prompt=action.prompt,
+            working_directory=current_dir,
+            user_id=user_id,
+            scope_key=scope_key_from_context(context),
         )
 
         if claude_response:
