@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import signal
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Dict, List, Optional
@@ -51,6 +52,12 @@ TASK_COMPLETED_MSG = "✅ Task completed. Tools used: {tools_summary}"
 # short: by this point the request has already failed, and the only thing left
 # to do is hand control back so the caller's cleanup can run.
 CANCELLED_TASK_CLEANUP_TIMEOUT = 10.0
+
+# Maximum number of descendant processes to reap alongside a wedged SDK child.
+# A wedged `claude` child owns its own MCP subprocesses (node, bun, ...), which
+# survive as orphans if only the direct child is killed. The cap is a guard
+# against a pathological /proc walk, not an expected limit.
+MAX_REAPED_DESCENDANTS = 64
 
 
 @dataclass
@@ -321,6 +328,98 @@ class ClaudeSDKManager:
             return False
         return True
 
+    @staticmethod
+    def _descendant_pids(root_pid: int) -> List[int]:
+        """Return descendants of *root_pid*, deepest-last, via /proc.
+
+        Linux-only and best-effort: a pid that exits mid-walk is skipped. Used
+        only to reap a wedged SDK child, so a partial answer is still useful.
+        Returns [] on any platform without /proc.
+        """
+        if not os.path.isdir("/proc"):
+            return []
+
+        children: Dict[int, List[int]] = {}
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            try:
+                with open(f"/proc/{entry}/status", encoding="utf-8") as fh:
+                    for line in fh:
+                        if line.startswith("PPid:"):
+                            ppid = int(line.split()[1])
+                            children.setdefault(ppid, []).append(int(entry))
+                            break
+            except (OSError, ValueError):
+                continue  # process exited or /proc entry unreadable
+
+        found: List[int] = []
+        queue = [root_pid]
+        while queue and len(found) < MAX_REAPED_DESCENDANTS:
+            for child in children.get(queue.pop(0), []):
+                if child not in found:
+                    found.append(child)
+                    queue.append(child)
+        return found
+
+    @classmethod
+    def _reap_wedged_child(cls, client: Optional[Any], reason: str) -> None:
+        """SIGKILL a wedged SDK child process and its descendants.
+
+        Called only after :meth:`_await_cancelled` reports that a cancelled
+        task never settled. At that point the transport's own cooperative
+        shutdown (terminate -> wait -> kill) is itself blocked, so the child
+        would otherwise leak until the service restarts. Observed 2026-08-21:
+        a wedged child survived 2h28m holding 660MB plus its MCP
+        subprocesses.
+
+        Reaches into SDK internals (``_transport._process``) deliberately —
+        there is no public accessor. Every step is best-effort and failure is
+        logged, never raised: this runs on a path that is already failing, and
+        must not mask the original error.
+        """
+        try:
+            transport = getattr(client, "_transport", None)
+            process = getattr(transport, "_process", None)
+            pid = getattr(process, "pid", None)
+            if pid is None:
+                return
+            if getattr(process, "returncode", None) is not None:
+                return  # already exited cleanly
+            # Never signal ourselves, init, or a whole process group.
+            if pid <= 1 or pid == os.getpid():
+                logger.error("Refusing to reap unsafe pid", pid=pid, reason=reason)
+                return
+
+            # Snapshot descendants before killing the parent — once it dies
+            # they reparent to init and the tree is no longer walkable.
+            descendants = cls._descendant_pids(pid)
+
+            killed: List[int] = []
+            for target in [pid, *descendants]:
+                try:
+                    os.kill(target, signal.SIGKILL)
+                    killed.append(target)
+                except ProcessLookupError:
+                    continue  # already gone
+                except PermissionError:
+                    logger.warning("Not permitted to reap pid", pid=target)
+
+            logger.error(
+                "Reaped wedged SDK child process tree",
+                reason=reason,
+                child_pid=pid,
+                killed_pids=killed,
+                descendant_count=len(descendants),
+            )
+        except Exception as exc:  # noqa: BLE001 - cleanup must never raise
+            logger.warning(
+                "Failed to reap wedged SDK child",
+                reason=reason,
+                error=str(exc),
+                error_type=type(exc).__name__,
+            )
+
     async def execute_command(
         self,
         prompt: str,
@@ -419,9 +518,13 @@ class ClaudeSDKManager:
             # Collect messages via ClaudeSDKClient
             messages: List[Message] = []
             interrupted = False
+            # Holds the live client so the cleanup path can reach its child
+            # process if cancellation fails to settle. Rebound per attempt.
+            client_holder: Dict[str, Any] = {}
 
             async def _run_client() -> None:
                 client = ClaudeSDKClient(options)
+                client_holder["client"] = client
                 try:
                     await client.connect()
 
@@ -537,11 +640,21 @@ class ClaudeSDKManager:
                         raise
                     # Interrupt cancelled the task — wait for cleanup, but do
                     # not let a wedged child block the interrupt forever.
-                    await self._await_cancelled(run_task, reason="user_interrupt")
+                    if not await self._await_cancelled(
+                        run_task, reason="user_interrupt"
+                    ):
+                        self._reap_wedged_child(
+                            client_holder.get("client"), reason="user_interrupt"
+                        )
                     break  # user interrupted — don't retry
                 except asyncio.TimeoutError:
                     run_task.cancel()
-                    await self._await_cancelled(run_task, reason="claude_timeout")
+                    if not await self._await_cancelled(
+                        run_task, reason="claude_timeout"
+                    ):
+                        self._reap_wedged_child(
+                            client_holder.get("client"), reason="claude_timeout"
+                        )
                     raise  # timeout — don't retry
                 except CLIConnectionError as exc:
                     if self._is_retryable_error(exc) and attempt < max_attempts - 1:
