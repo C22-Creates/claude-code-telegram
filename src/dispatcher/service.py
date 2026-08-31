@@ -34,6 +34,29 @@ FAILED = "failed"
 # How much of a Claude response to retain on the board as the task result.
 MAX_RESULT_CHARS = 4000
 
+# Markers that indicate a Claude session's response text is actually a
+# surfaced API-level failure. The Claude Agent SDK returns these as normal
+# ResultMessage content (ClaudeResponse.is_error stays False) rather than
+# raising -- see src/claude/sdk_integration.py -- so the dispatcher must
+# inspect the content itself before completing a task, or a session that
+# failed mid-flight gets marked done. Audit finding 8/17 (task 6b0be48b...):
+# a 529 overloaded_error response was recorded as done with the API error
+# text as the result, silencing exception routing and the health check.
+FAILURE_MARKERS = (
+    "API Error",            # Anthropic API error payloads (529, 500, ...)
+    "overloaded_error",
+    "ClaudeTimeoutError",
+    "timed out after",
+)
+
+
+def result_is_failure(result_text: Optional[str]) -> bool:
+    """True if a Claude session's result text is actually a surfaced failure,
+    not a genuine completion. See FAILURE_MARKERS for the defect this guards."""
+    if not result_text:
+        return False
+    return any(marker in result_text for marker in FAILURE_MARKERS)
+
 
 @dataclass
 class RunOutcome:
@@ -186,6 +209,10 @@ class DispatcherService:
         if outcome is not None and outcome.blocked:
             reason = outcome.block_reason or "needs human input"
             return self._board.block(task_id, reason)
+        if outcome is not None and result_is_failure(outcome.content):
+            # The session didn't raise, but its own response text is a
+            # surfaced API-level failure -- never let this reach complete().
+            return self._board.fail(task_id, outcome.content[:MAX_RESULT_CHARS])
         result = None
         if outcome is not None and outcome.content:
             result = {"content": outcome.content[:MAX_RESULT_CHARS]}

@@ -10,6 +10,7 @@ from typing import Any, Dict, List
 import structlog
 
 from ..claude.facade import ClaudeIntegration
+from ..utils.constants import SCOPE_SCHEDULER, SCOPE_WEBHOOK, SYSTEM_USER_ID
 from .bus import Event, EventBus
 from .types import AgentResponseEvent, ScheduledEvent, WebhookEvent
 
@@ -29,7 +30,7 @@ class AgentHandler:
         event_bus: EventBus,
         claude_integration: ClaudeIntegration,
         default_working_directory: Path,
-        default_user_id: int = 0,
+        default_user_id: int = SYSTEM_USER_ID,
     ) -> None:
         self.event_bus = event_bus
         self.claude = claude_integration
@@ -60,6 +61,8 @@ class AgentHandler:
                 prompt=prompt,
                 working_directory=self.default_working_directory,
                 user_id=self.default_user_id,
+                force_new=True,
+                scope_key=SCOPE_WEBHOOK,
             )
 
             if response.content:
@@ -105,6 +108,13 @@ class AgentHandler:
                 prompt=prompt,
                 working_directory=working_dir,
                 user_id=self.default_user_id,
+                # A cron run is a self-contained unit of work, like a board
+                # task. It already behaved this way in practice — every run
+                # started fresh because its predecessor had been evicted from
+                # the shared pool — so this makes the intent explicit rather
+                # than leaving it to eviction timing.
+                force_new=True,
+                scope_key=SCOPE_SCHEDULER,
             )
 
             if response.content:

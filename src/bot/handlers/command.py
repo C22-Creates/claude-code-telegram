@@ -17,6 +17,7 @@ from ...security.audit import AuditLogger
 from ...security.validators import SecurityValidator
 from ...storage.models import SessionModel
 from ..utils.html_format import escape_html
+from ..utils.session_scope import scope_key_from_context
 
 logger = structlog.get_logger()
 
@@ -400,6 +401,7 @@ async def continue_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 prompt=prompt or default_prompt,
                 working_directory=current_dir,
                 user_id=user_id,
+                scope_key=scope_key_from_context(context),
                 session_id=claude_session_id,
             )
         else:
@@ -694,7 +696,7 @@ async def change_directory(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         resumed_session_info = ""
         if claude_integration:
             existing_session = await claude_integration._find_resumable_session(
-                user_id, resolved_path
+                user_id, resolved_path, scope_key_from_context(context)
             )
             if existing_session:
                 context.user_data["claude_session_id"] = existing_session.session_id
@@ -896,7 +898,7 @@ async def session_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         if claude_integration:
             existing = await claude_integration._find_resumable_session(
-                user_id, current_dir
+                user_id, current_dir, scope_key_from_context(context)
             )
             if existing:
                 resumable_info = (

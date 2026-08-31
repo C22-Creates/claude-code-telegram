@@ -73,6 +73,7 @@ class SQLiteSessionStorage(SessionStorage):
             total_cost=session.total_cost,
             total_turns=session.total_turns,
             message_count=session.message_count,
+            scope_key=session.scope_key,
         )
 
         async with self.db_manager.get_connection() as conn:
@@ -98,8 +99,8 @@ class SQLiteSessionStorage(SessionStorage):
                     """
                     INSERT INTO sessions
                     (session_id, user_id, project_path, created_at, last_used,
-                     total_cost, total_turns, message_count)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                     total_cost, total_turns, message_count, scope_key)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                     (
                         session_model.session_id,
@@ -110,6 +111,7 @@ class SQLiteSessionStorage(SessionStorage):
                         session_model.total_cost,
                         session_model.total_turns,
                         session_model.message_count,
+                        session_model.scope_key,
                     ),
                 )
 
@@ -148,6 +150,7 @@ class SQLiteSessionStorage(SessionStorage):
                 total_turns=session_model.total_turns,
                 message_count=session_model.message_count,
                 tools_used=[],  # Tools are tracked separately in tool_usage table
+                scope_key=session_model.scope_key,
             )
 
             logger.debug(
@@ -195,6 +198,7 @@ class SQLiteSessionStorage(SessionStorage):
                     total_turns=session_model.total_turns,
                     message_count=session_model.message_count,
                     tools_used=[],  # Tools are tracked separately
+                    scope_key=session_model.scope_key,
                 )
                 sessions.append(claude_session)
 
@@ -221,6 +225,7 @@ class SQLiteSessionStorage(SessionStorage):
                     total_turns=session_model.total_turns,
                     message_count=session_model.message_count,
                     tools_used=[],  # Tools are tracked separately
+                    scope_key=session_model.scope_key,
                 )
                 sessions.append(claude_session)
 
