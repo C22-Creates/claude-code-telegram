@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import time
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -1184,3 +1185,168 @@ class TestClaudeMdLoading:
 
         opts = captured[0]
         assert opts.setting_sources == ["project"]
+
+
+class TestAwaitCancelledBounded:
+    """Cancelling an SDK task must never hang the caller.
+
+    Regression guard for the 2026-07-29 incident: a wedged child process
+    swallowed cancellation, the bare `await run_task` in the cleanup path
+    never returned, and the orchestrator's `finally: heartbeat.cancel()`
+    therefore never ran — leaving the Telegram typing indicator on forever
+    and the child orphaned for 15.5 hours.
+    """
+
+    @staticmethod
+    async def _wedged_task(stop: asyncio.Event) -> None:
+        """A task that swallows cancellation, like a child stuck on a pipe read."""
+        while not stop.is_set():
+            try:
+                await asyncio.sleep(0.01)
+            except asyncio.CancelledError:
+                pass  # refuse to die — this is the failure mode under test
+
+    async def test_returns_false_and_does_not_hang_when_task_ignores_cancel(self):
+        stop = asyncio.Event()
+        task = asyncio.create_task(self._wedged_task(stop))
+        await asyncio.sleep(0)  # let it start
+
+        task.cancel()
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        settled = await ClaudeSDKManager._await_cancelled(
+            task, reason="test", timeout=0.05
+        )
+        elapsed = loop.time() - started
+
+        assert settled is False, "a wedged task must be reported as unsettled"
+        # The point of the fix: control returns on a bound, not never.
+        assert elapsed < 2.0, f"cleanup await was not bounded (took {elapsed:.2f}s)"
+
+        # Let the fixture task exit so it does not leak into other tests.
+        stop.set()
+        await asyncio.wait({task}, timeout=1.0)
+
+    async def test_returns_true_when_task_honors_cancellation(self):
+        async def _cooperative() -> None:
+            await asyncio.sleep(60)
+
+        task = asyncio.create_task(_cooperative())
+        await asyncio.sleep(0)
+        task.cancel()
+
+        settled = await ClaudeSDKManager._await_cancelled(
+            task, reason="test", timeout=1.0
+        )
+
+        assert settled is True
+        assert task.cancelled()
+
+
+def _process_state(pid: int) -> str:
+    """Return the Linux process state letter, or "gone" if the pid is absent.
+
+    "Z" (zombie) counts as dead for reaping purposes — the process no longer
+    runs, it is merely waiting to be reaped by its parent.
+    """
+    try:
+        with open(f"/proc/{pid}/status", encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("State:"):
+                    return line.split()[1]
+    except OSError:
+        return "gone"
+    return "gone"
+
+
+def _is_running(pid: int) -> bool:
+    return _process_state(pid) not in ("gone", "Z", "X")
+
+
+@pytest.mark.skipif(
+    not os.path.isdir("/proc"), reason="requires Linux /proc for pid discovery"
+)
+class TestReapWedgedChild:
+    """A wedged SDK child and its MCP subprocesses must not outlive the request.
+
+    Regression guard for the 2026-08-21 recurrence: after cancellation failed
+    to settle, the `claude` child survived 2h28m holding 660MB plus its own
+    node/bun MCP subprocesses, because the transport's cooperative shutdown
+    was itself blocked.
+    """
+
+    @staticmethod
+    def _spawn_tree():
+        """Spawn `sh` owning two `sleep` children; returns the Popen."""
+        import subprocess
+
+        # Trailing `true` prevents the shell from exec'ing into the last sleep,
+        # so `sh` survives as the parent of both children.
+        return subprocess.Popen(["sh", "-c", "sleep 300 & sleep 300; true"])
+
+    @staticmethod
+    def _fake_client(pid: int, returncode=None):
+        import types
+
+        process = types.SimpleNamespace(pid=pid, returncode=returncode)
+        transport = types.SimpleNamespace(_process=process)
+        return types.SimpleNamespace(_transport=transport)
+
+    def test_kills_child_and_its_descendants(self):
+        proc = self._spawn_tree()
+        try:
+            # Give the shell a moment to fork both sleeps.
+            deadline = time.monotonic() + 5.0
+            descendants = []
+            while time.monotonic() < deadline:
+                descendants = ClaudeSDKManager._descendant_pids(proc.pid)
+                if len(descendants) >= 2:
+                    break
+                time.sleep(0.05)
+
+            assert (
+                len(descendants) >= 2
+            ), f"expected to discover 2 sleep children, found {descendants}"
+
+            ClaudeSDKManager._reap_wedged_child(
+                self._fake_client(proc.pid), reason="test"
+            )
+
+            assert proc.wait(timeout=5) != 0, "child should have been killed"
+            for pid in descendants:
+                assert not _is_running(pid), f"descendant {pid} survived the reap"
+        finally:
+            proc.kill()
+            proc.wait(timeout=5)
+
+    def test_skips_process_that_already_exited(self):
+        proc = self._spawn_tree()
+        proc.kill()
+        proc.wait(timeout=5)
+
+        # returncode set => transport already shut down cleanly; nothing to do.
+        ClaudeSDKManager._reap_wedged_child(
+            self._fake_client(proc.pid, returncode=0), reason="test"
+        )
+
+    def test_refuses_to_kill_own_process(self):
+        # The guard matters: SIGKILL on our own pid would take down the bot.
+        ClaudeSDKManager._reap_wedged_child(
+            self._fake_client(os.getpid()), reason="test"
+        )
+        assert _is_running(os.getpid())
+
+    @pytest.mark.parametrize("client", [None, object(), "not-a-client"])
+    def test_never_raises_on_unexpected_client(self, client):
+        # Runs on an already-failing path; it must not mask the original error.
+        ClaudeSDKManager._reap_wedged_child(client, reason="test")
+
+    def test_descendant_pids_of_leaf_process_is_empty(self):
+        import subprocess
+
+        proc = subprocess.Popen(["sleep", "300"])
+        try:
+            assert ClaudeSDKManager._descendant_pids(proc.pid) == []
+        finally:
+            proc.kill()
+            proc.wait(timeout=5)

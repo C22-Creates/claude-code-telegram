@@ -38,6 +38,10 @@ class ClaudeSession:
     message_count: int = 0
     tools_used: List[str] = field(default_factory=list)
     is_new_session: bool = False  # True if session hasn't been sent to Claude Code yet
+    # Conversation boundary: "chat:<chat_id>:<thread_id>" for Telegram topics,
+    # "hermes"/"scheduler" for background work, None for legacy rows. Sessions
+    # only resume within, and only evict within, their own scope.
+    scope_key: Optional[str] = None
 
     def is_expired(self, timeout_hours: int) -> bool:
         """Check if session has expired."""
@@ -70,6 +74,7 @@ class ClaudeSession:
             "total_turns": self.total_turns,
             "message_count": self.message_count,
             "tools_used": self.tools_used,
+            "scope_key": self.scope_key,
         }
 
     @classmethod
@@ -85,6 +90,7 @@ class ClaudeSession:
             total_turns=data.get("total_turns", 0),
             message_count=data.get("message_count", 0),
             tools_used=data.get("tools_used", []),
+            scope_key=data.get("scope_key"),
         )
 
 
@@ -128,6 +134,7 @@ class SessionManager:
         user_id: int,
         project_path: Path,
         session_id: Optional[str] = None,
+        scope_key: Optional[str] = None,
     ) -> ClaudeSession:
         """Get existing session or create new one."""
         logger.info(
@@ -135,6 +142,7 @@ class SessionManager:
             user_id=user_id,
             project_path=str(project_path),
             session_id=session_id,
+            scope_key=scope_key,
         )
 
         # Check for existing session
@@ -159,16 +167,22 @@ class SessionManager:
                 logger.info("Loaded session from storage", session_id=session_id)
                 return session
 
-        # Check user session limit
+        # Check session limit *within this scope only*. Evicting across scopes
+        # is what let background work delete live conversations: a Hermes task
+        # would claim a slot and drop the oldest session in the pool, which was
+        # often a Telegram topic the user was still talking in. A scope can only
+        # ever evict its own history.
         user_sessions = await self._get_user_sessions(user_id)
-        if len(user_sessions) >= self.config.max_sessions_per_user:
-            # Remove oldest session
-            oldest = min(user_sessions, key=lambda s: s.last_used)
+        scope_sessions = [s for s in user_sessions if s.scope_key == scope_key]
+        if len(scope_sessions) >= self.config.max_sessions_per_user:
+            # Remove oldest session in this scope
+            oldest = min(scope_sessions, key=lambda s: s.last_used)
             await self.remove_session(oldest.session_id)
             logger.info(
                 "Removed oldest session due to limit",
                 removed_session_id=oldest.session_id,
                 user_id=user_id,
+                scope_key=scope_key,
             )
 
         # Create session with empty ID — Claude will provide the real one
@@ -179,6 +193,7 @@ class SessionManager:
             created_at=datetime.now(UTC),
             last_used=datetime.now(UTC),
             is_new_session=True,
+            scope_key=scope_key,
         )
 
         # Don't save to storage yet — deferred until after Claude responds

@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import signal
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Dict, List, Optional
@@ -44,6 +45,19 @@ logger = structlog.get_logger()
 
 # Fallback message when Claude produces no text but did use tools.
 TASK_COMPLETED_MSG = "✅ Task completed. Tools used: {tools_summary}"
+
+# How long to wait for an already-cancelled SDK task to actually settle before
+# abandoning it. Cancellation is not guaranteed to land — see
+# ClaudeSDKManager._await_cancelled for the failure mode this bounds. Kept
+# short: by this point the request has already failed, and the only thing left
+# to do is hand control back so the caller's cleanup can run.
+CANCELLED_TASK_CLEANUP_TIMEOUT = 10.0
+
+# Maximum number of descendant processes to reap alongside a wedged SDK child.
+# A wedged `claude` child owns its own MCP subprocesses (node, bun, ...), which
+# survive as orphans if only the direct child is killed. The cap is a guard
+# against a pathological /proc walk, not an expected limit.
+MAX_REAPED_DESCENDANTS = 64
 
 
 @dataclass
@@ -261,12 +275,150 @@ class ClaudeSDKManager:
     def _is_retryable_error(self, exc: BaseException) -> bool:
         """Return True for transient errors that warrant a retry.
         asyncio.TimeoutError is intentional (user-configured timeout) — not retried.
-        Only non-MCP CLIConnectionError is considered transient.
+        Non-MCP CLIConnectionError and control-protocol handshake timeouts are
+        considered transient.
         """
         if isinstance(exc, CLIConnectionError):
             msg = str(exc).lower()
             return "mcp" not in msg  # "server" alone is too broad
+        # claude-agent-sdk raises a bare Exception when the control-protocol
+        # handshake times out (e.g. "Control request timeout: initialize").
+        # This is a transient subprocess startup failure — not a user-configured
+        # limit — so it is safe to retry. Match on the exact bare Exception type
+        # plus message to avoid retrying unrelated programming errors.
+        if type(exc) is Exception:
+            return "control request timeout" in str(exc).lower()
         return False
+
+    @staticmethod
+    async def _await_cancelled(
+        task: "asyncio.Task[None]",
+        reason: str,
+        timeout: float = CANCELLED_TASK_CLEANUP_TIMEOUT,
+    ) -> bool:
+        """Wait — with a hard bound — for an already-cancelled task to finish.
+
+        A bare ``await task`` after ``task.cancel()`` is NOT guaranteed to
+        return. If the SDK child process is wedged (blocked reading a stdout
+        pipe that never yields and never closes), the CancelledError is never
+        delivered at an await point and the await hangs forever.
+
+        That hang propagates all the way up. ``execute_command`` never
+        returns, so the orchestrator's ``finally: heartbeat.cancel()`` never
+        runs — leaving the Telegram typing indicator running forever while
+        the wedged child leaks. Observed 2026-07-29: the bot appeared
+        permanently "typing" and a 15.5h-old orphaned child held 220MB plus
+        its own MCP subprocesses. The 5-minute claude_timeout_seconds fired
+        correctly and did not help, because the hang was in the cleanup path
+        that runs *after* the timeout.
+
+        Returns True if the task settled, False if it is still wedged. A
+        False return is a leak we cannot fix from here, so it is logged at
+        error level — but we return control to the caller either way, which
+        is what stops the typing indicator and frees the request slot.
+        """
+        _, pending = await asyncio.wait({task}, timeout=timeout)
+        if pending:
+            logger.error(
+                "Cancelled SDK task did not settle; abandoning it to avoid "
+                "hanging the request. The child process may be orphaned.",
+                reason=reason,
+                timeout_seconds=timeout,
+            )
+            return False
+        return True
+
+    @staticmethod
+    def _descendant_pids(root_pid: int) -> List[int]:
+        """Return descendants of *root_pid*, deepest-last, via /proc.
+
+        Linux-only and best-effort: a pid that exits mid-walk is skipped. Used
+        only to reap a wedged SDK child, so a partial answer is still useful.
+        Returns [] on any platform without /proc.
+        """
+        if not os.path.isdir("/proc"):
+            return []
+
+        children: Dict[int, List[int]] = {}
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            try:
+                with open(f"/proc/{entry}/status", encoding="utf-8") as fh:
+                    for line in fh:
+                        if line.startswith("PPid:"):
+                            ppid = int(line.split()[1])
+                            children.setdefault(ppid, []).append(int(entry))
+                            break
+            except (OSError, ValueError):
+                continue  # process exited or /proc entry unreadable
+
+        found: List[int] = []
+        queue = [root_pid]
+        while queue and len(found) < MAX_REAPED_DESCENDANTS:
+            for child in children.get(queue.pop(0), []):
+                if child not in found:
+                    found.append(child)
+                    queue.append(child)
+        return found
+
+    @classmethod
+    def _reap_wedged_child(cls, client: Optional[Any], reason: str) -> None:
+        """SIGKILL a wedged SDK child process and its descendants.
+
+        Called only after :meth:`_await_cancelled` reports that a cancelled
+        task never settled. At that point the transport's own cooperative
+        shutdown (terminate -> wait -> kill) is itself blocked, so the child
+        would otherwise leak until the service restarts. Observed 2026-08-21:
+        a wedged child survived 2h28m holding 660MB plus its MCP
+        subprocesses.
+
+        Reaches into SDK internals (``_transport._process``) deliberately —
+        there is no public accessor. Every step is best-effort and failure is
+        logged, never raised: this runs on a path that is already failing, and
+        must not mask the original error.
+        """
+        try:
+            transport = getattr(client, "_transport", None)
+            process = getattr(transport, "_process", None)
+            pid = getattr(process, "pid", None)
+            if pid is None:
+                return
+            if getattr(process, "returncode", None) is not None:
+                return  # already exited cleanly
+            # Never signal ourselves, init, or a whole process group.
+            if pid <= 1 or pid == os.getpid():
+                logger.error("Refusing to reap unsafe pid", pid=pid, reason=reason)
+                return
+
+            # Snapshot descendants before killing the parent — once it dies
+            # they reparent to init and the tree is no longer walkable.
+            descendants = cls._descendant_pids(pid)
+
+            killed: List[int] = []
+            for target in [pid, *descendants]:
+                try:
+                    os.kill(target, signal.SIGKILL)
+                    killed.append(target)
+                except ProcessLookupError:
+                    continue  # already gone
+                except PermissionError:
+                    logger.warning("Not permitted to reap pid", pid=target)
+
+            logger.error(
+                "Reaped wedged SDK child process tree",
+                reason=reason,
+                child_pid=pid,
+                killed_pids=killed,
+                descendant_count=len(descendants),
+            )
+        except Exception as exc:  # noqa: BLE001 - cleanup must never raise
+            logger.warning(
+                "Failed to reap wedged SDK child",
+                reason=reason,
+                error=str(exc),
+                error_type=type(exc).__name__,
+            )
 
     async def execute_command(
         self,
@@ -277,6 +429,9 @@ class ClaudeSDKManager:
         stream_callback: Optional[Callable[[StreamUpdate], None]] = None,
         interrupt_event: Optional[asyncio.Event] = None,
         images: Optional[List[Dict[str, str]]] = None,
+        model: Optional[str] = None,
+        extra_disallowed_tools: Optional[List[str]] = None,
+        topic_agent: Optional[str] = None,
     ) -> ClaudeResponse:
         """Execute Claude Code command via SDK."""
         start_time = asyncio.get_event_loop().time()
@@ -309,6 +464,40 @@ class ClaudeSDKManager:
                     path=str(claude_md_path),
                 )
 
+            # Per-topic agent identity (agents/README.md § Loader contract):
+            # callers that know their topic's declared agent (the Telegram
+            # message path via _thread_context) pass it explicitly. Never
+            # inferred from working_directory — the topic dirs are symlinks
+            # that resolve to one checkout, and session state can rewrite the
+            # working dir, so path-keying misidentifies the topic (live
+            # incident 2026-09-04: Relationships session booted as coach and
+            # had every Missive tool denied).
+            if topic_agent and bool(
+                getattr(self.config, "agent_loader_enabled", True)
+            ):
+                from ..dispatcher.agent_loader import load_agent
+
+                identity, topic_denied = load_agent(
+                    topic_agent, Path(working_directory)
+                )
+                if identity:
+                    base_prompt += "\n\n" + identity
+                if topic_denied:
+                    enforcement = str(
+                        getattr(self.config, "agent_tool_enforcement", "enforce")
+                    )
+                    if enforcement == "enforce":
+                        extra_disallowed_tools = [
+                            *(extra_disallowed_tools or []),
+                            *topic_denied,
+                        ]
+                    else:
+                        logger.warning(
+                            "Topic agent tool denials in warn mode; NOT enforced",
+                            agent=topic_agent,
+                            would_deny=topic_denied,
+                        )
+
             # When DISABLE_TOOL_VALIDATION=true, pass None for allowed/disallowed
             # tools so the SDK does not restrict tool usage (e.g. MCP tools).
             if self.config.disable_tool_validation:
@@ -318,10 +507,23 @@ class ClaudeSDKManager:
                 sdk_allowed_tools = self.config.claude_allowed_tools
                 sdk_disallowed_tools = self.config.claude_disallowed_tools
 
+            # Agent-level hard denials (dispatcher loader, agents/scoping.md)
+            # apply even when config-level tool validation is disabled — they
+            # are enforcement policy, not schema validation.
+            if extra_disallowed_tools:
+                sdk_disallowed_tools = [
+                    *(sdk_disallowed_tools or []),
+                    *extra_disallowed_tools,
+                ]
+                logger.info(
+                    "Agent tool denials active",
+                    disallowed=extra_disallowed_tools,
+                )
+
             # Build Claude Agent options
             options = ClaudeAgentOptions(
                 max_turns=self.config.claude_max_turns,
-                model=self.config.claude_model or None,
+                model=model or self.config.claude_model or None,
                 max_budget_usd=self.config.claude_max_cost_per_request,
                 cwd=str(working_directory),
                 allowed_tools=sdk_allowed_tools,
@@ -365,9 +567,13 @@ class ClaudeSDKManager:
             # Collect messages via ClaudeSDKClient
             messages: List[Message] = []
             interrupted = False
+            # Holds the live client so the cleanup path can reach its child
+            # process if cancellation fails to settle. Rebound per attempt.
+            client_holder: Dict[str, Any] = {}
 
             async def _run_client() -> None:
                 client = ClaudeSDKClient(options)
+                client_holder["client"] = client
                 try:
                     await client.connect()
 
@@ -481,24 +687,44 @@ class ClaudeSDKManager:
                 except asyncio.CancelledError:
                     if not interrupted:
                         raise
-                    # Interrupt cancelled the task — wait for cleanup
-                    try:
-                        await run_task
-                    except asyncio.CancelledError:
-                        pass
+                    # Interrupt cancelled the task — wait for cleanup, but do
+                    # not let a wedged child block the interrupt forever.
+                    if not await self._await_cancelled(
+                        run_task, reason="user_interrupt"
+                    ):
+                        self._reap_wedged_child(
+                            client_holder.get("client"), reason="user_interrupt"
+                        )
                     break  # user interrupted — don't retry
                 except asyncio.TimeoutError:
                     run_task.cancel()
-                    try:
-                        await run_task
-                    except asyncio.CancelledError:
-                        pass
+                    if not await self._await_cancelled(
+                        run_task, reason="claude_timeout"
+                    ):
+                        self._reap_wedged_child(
+                            client_holder.get("client"), reason="claude_timeout"
+                        )
                     raise  # timeout — don't retry
                 except CLIConnectionError as exc:
                     if self._is_retryable_error(exc) and attempt < max_attempts - 1:
                         last_exc = exc
                         logger.warning(
                             "Transient connection error, will retry",
+                            attempt=attempt + 1,
+                            error=str(exc),
+                        )
+                        continue
+                    raise  # non-retryable or attempts exhausted
+                except Exception as exc:  # noqa: BLE001
+                    # Catches transient control-protocol handshake timeouts
+                    # ("Control request timeout: initialize") that the SDK raises
+                    # as a bare Exception. Only retried when _is_retryable_error
+                    # matches; every other exception re-raises immediately, which
+                    # preserves the prior behaviour.
+                    if self._is_retryable_error(exc) and attempt < max_attempts - 1:
+                        last_exc = exc
+                        logger.warning(
+                            "Transient SDK error, will retry",
                             attempt=attempt + 1,
                             error=str(exc),
                         )

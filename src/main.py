@@ -37,6 +37,7 @@ from src.security.rate_limiter import RateLimiter
 from src.security.validators import SecurityValidator
 from src.storage.facade import Storage
 from src.storage.session_storage import SQLiteSessionStorage
+from src.utils.constants import SYSTEM_USER_ID
 
 
 def setup_logging(debug: bool = False) -> None:
@@ -161,12 +162,15 @@ async def create_application(config: Settings) -> Dict[str, Any]:
     )
     event_security.register()
 
-    # Agent handler — translates events into Claude executions
+    # Agent handler — translates events into Claude executions.
+    # Runs as the system user, not the first allowed human: scheduled and
+    # webhook work must not consume a human's session pool, cost budget, or
+    # audit trail.
     agent_handler = AgentHandler(
         event_bus=event_bus,
         claude_integration=claude_integration,
         default_working_directory=config.approved_directory,
-        default_user_id=config.allowed_users[0] if config.allowed_users else 0,
+        default_user_id=SYSTEM_USER_ID,
     )
     agent_handler.register()
 
@@ -255,6 +259,7 @@ async def run_application(app: Dict[str, Any]) -> None:
             bot.deps["project_registry"] = registry
             bot.deps["project_threads_manager"] = project_threads_manager
 
+
             if config.project_threads_mode == "group":
                 if config.project_threads_chat_id is None:
                     raise ConfigurationError(
@@ -337,9 +342,8 @@ async def run_application(app: Dict[str, Any]) -> None:
                 default_working_directory=config.approved_directory,
                 board_db_path=config.hermes_board_db,
                 hermes_cli_path=config.hermes_path / "cli.py",
-                default_user_id=(
-                    config.allowed_users[0] if config.allowed_users else 0
-                ),
+                # Board tasks run as the system user — see AgentHandler above.
+                default_user_id=SYSTEM_USER_ID,
             )
             dispatcher = DispatcherService(
                 board=board,
