@@ -430,6 +430,7 @@ class ClaudeSDKManager:
         interrupt_event: Optional[asyncio.Event] = None,
         images: Optional[List[Dict[str, str]]] = None,
         model: Optional[str] = None,
+        extra_disallowed_tools: Optional[List[str]] = None,
     ) -> ClaudeResponse:
         """Execute Claude Code command via SDK."""
         start_time = asyncio.get_event_loop().time()
@@ -470,6 +471,19 @@ class ClaudeSDKManager:
             else:
                 sdk_allowed_tools = self.config.claude_allowed_tools
                 sdk_disallowed_tools = self.config.claude_disallowed_tools
+
+            # Agent-level hard denials (dispatcher loader, agents/scoping.md)
+            # apply even when config-level tool validation is disabled — they
+            # are enforcement policy, not schema validation.
+            if extra_disallowed_tools:
+                sdk_disallowed_tools = [
+                    *(sdk_disallowed_tools or []),
+                    *extra_disallowed_tools,
+                ]
+                logger.info(
+                    "Agent tool denials active",
+                    disallowed=extra_disallowed_tools,
+                )
 
             # Build Claude Agent options
             options = ClaudeAgentOptions(

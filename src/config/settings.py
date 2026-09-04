@@ -326,6 +326,18 @@ class Settings(BaseSettings):
     dispatcher_heartbeat_seconds: int = Field(
         120, description="Interval (seconds) for heartbeating in-flight tasks", ge=10
     )
+    agent_loader_enabled: bool = Field(
+        True,
+        description=(
+            "Load agents/<assignee>/ identity + enforcement for Hermes tasks "
+            "(see agents/README.md in c22os)"
+        ),
+    )
+    agent_tool_enforcement: str = Field(
+        "enforce",
+        description="Agent tool denials: 'enforce' blocks at the SDK, 'warn' logs only",
+        pattern="^(enforce|warn)$",
+    )
 
     github_webhook_secret: Optional[str] = Field(
         None, description="GitHub webhook HMAC secret"

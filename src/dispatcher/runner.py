@@ -14,6 +14,7 @@ import structlog
 
 from ..claude.facade import ClaudeIntegration
 from ..utils.constants import SCOPE_HERMES, SYSTEM_USER_ID
+from .agent_loader import load_agent
 from .service import RunOutcome
 
 logger = structlog.get_logger()
@@ -85,8 +86,22 @@ class ClaudeTaskRunner:
         self._default_user_id = default_user_id
 
     async def run(self, task: Dict[str, Any]) -> RunOutcome:
-        prompt = self._build_prompt(task)
         working_dir = self._working_directory(task)
+        config = getattr(self._claude, "config", None)
+        identity = None
+        denied: list = []
+        if bool(getattr(config, "agent_loader_enabled", True)):
+            identity, denied = load_agent(task.get("assignee"), working_dir)
+        enforcement = str(getattr(config, "agent_tool_enforcement", "enforce"))
+        if denied and enforcement != "enforce":
+            logger.warning(
+                "Agent tool denials in warn mode; NOT enforced",
+                task_id=task["id"],
+                assignee=task.get("assignee"),
+                would_deny=denied,
+            )
+            denied = []
+        prompt = self._build_prompt(task, identity=identity)
         model = resolve_model(task)
         if model:
             logger.info("Model override for task", task_id=task["id"], model=model)
@@ -94,6 +109,7 @@ class ClaudeTaskRunner:
         response = await self._claude.run_command(
             prompt=prompt,
             working_directory=working_dir,
+            extra_disallowed_tools=denied or None,
             user_id=self._default_user_id,
             force_new=True,  # each task is an independent unit of work
             model=model,
@@ -115,7 +131,9 @@ class ClaudeTaskRunner:
             return Path(payload["_working_directory"])
         return self._default_working_directory
 
-    def _build_prompt(self, task: Dict[str, Any]) -> str:
+    def _build_prompt(
+        self, task: Dict[str, Any], identity: Optional[str] = None
+    ) -> str:
         task_id = task["id"]
         payload = task.get("payload")
         payload_str = json.dumps(payload, indent=2) if payload is not None else "(none)"
@@ -124,7 +142,9 @@ class ClaudeTaskRunner:
             f"python3 {self._hermes_cli_path} --db {self._board_db_path} "
             f'block {task_id} --reason "<your specific question>"'
         )
+        identity_block = f"{identity}\n\n---\n\n" if identity else ""
         return (
+            f"{identity_block}"
             f"You are working Hermes task `{task_id}`, acting as {assignee}.\n\n"
             f"## Task\n{task['title']}\n\n"
             f"## Payload\n{payload_str}\n\n"

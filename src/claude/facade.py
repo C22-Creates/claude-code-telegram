@@ -59,6 +59,7 @@ class ClaudeIntegration:
         images: Optional[List[Dict[str, str]]] = None,
         model: Optional[str] = None,
         scope_key: Optional[str] = None,
+        extra_disallowed_tools: Optional[List[str]] = None,
     ) -> ClaudeResponse:
         """Run Claude Code command with full integration."""
         async with self._conversation_lock(user_id, working_directory, scope_key):
@@ -73,6 +74,7 @@ class ClaudeIntegration:
                 images=images,
                 model=model,
                 scope_key=scope_key,
+                extra_disallowed_tools=extra_disallowed_tools,
             )
 
     async def _run_command_locked(
@@ -87,6 +89,7 @@ class ClaudeIntegration:
         images: Optional[List[Dict[str, str]]] = None,
         model: Optional[str] = None,
         scope_key: Optional[str] = None,
+        extra_disallowed_tools: Optional[List[str]] = None,
     ) -> ClaudeResponse:
         """Run one command. Caller holds the conversation lock."""
         logger.info(
@@ -140,6 +143,7 @@ class ClaudeIntegration:
                     interrupt_event=interrupt_event,
                     images=images,
                     model=model,
+                    extra_disallowed_tools=extra_disallowed_tools,
                 )
             except ClaudeTimeoutError:
                 # A timeout says the turn was too slow — NOT that the session is
@@ -173,6 +177,7 @@ class ClaudeIntegration:
                     response = await self._execute(
                         prompt=prompt,
                         working_directory=working_directory,
+                        extra_disallowed_tools=extra_disallowed_tools,
                         session_id=None,
                         continue_session=False,
                         stream_callback=on_stream,
@@ -225,6 +230,7 @@ class ClaudeIntegration:
         interrupt_event: Optional[asyncio.Event] = None,
         images: Optional[List[Dict[str, str]]] = None,
         model: Optional[str] = None,
+        extra_disallowed_tools: Optional[List[str]] = None,
     ) -> ClaudeResponse:
         """Execute command via SDK."""
         return await self.sdk_manager.execute_command(
@@ -236,6 +242,7 @@ class ClaudeIntegration:
             interrupt_event=interrupt_event,
             images=images,
             model=model,
+            extra_disallowed_tools=extra_disallowed_tools,
         )
 
     async def _find_resumable_session(
