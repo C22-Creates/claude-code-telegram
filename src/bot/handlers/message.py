@@ -25,7 +25,7 @@ from ..utils.image_extractor import (
     should_send_as_photo,
     validate_image_path,
 )
-from ..utils.session_scope import scope_key_from_context
+from ..utils.session_scope import scope_key_from_context, topic_agent_from_context
 
 logger = structlog.get_logger()
 
@@ -398,6 +398,7 @@ async def handle_text_message(
                 working_directory=current_dir,
                 user_id=user_id,
                 scope_key=scope_key_from_context(context),
+                topic_agent=topic_agent_from_context(context),
                 session_id=session_id,
                 on_stream=stream_handler,
                 force_new=force_new,
@@ -826,6 +827,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 working_directory=current_dir,
                 user_id=user_id,
                 scope_key=scope_key_from_context(context),
+                topic_agent=topic_agent_from_context(context),
                 session_id=session_id,
             )
 
@@ -954,6 +956,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                     working_directory=current_dir,
                     user_id=user_id,
                     scope_key=scope_key_from_context(context),
+                topic_agent=topic_agent_from_context(context),
                     session_id=session_id,
                 )
 
@@ -1083,6 +1086,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 working_directory=current_dir,
                 user_id=user_id,
                 scope_key=scope_key_from_context(context),
+                topic_agent=topic_agent_from_context(context),
                 session_id=session_id,
             )
 

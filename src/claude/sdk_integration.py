@@ -431,6 +431,7 @@ class ClaudeSDKManager:
         images: Optional[List[Dict[str, str]]] = None,
         model: Optional[str] = None,
         extra_disallowed_tools: Optional[List[str]] = None,
+        topic_agent: Optional[str] = None,
     ) -> ClaudeResponse:
         """Execute Claude Code command via SDK."""
         start_time = asyncio.get_event_loop().time()
@@ -464,39 +465,38 @@ class ClaudeSDKManager:
                 )
 
             # Per-topic agent identity (agents/README.md § Loader contract):
-            # a resolver wired at startup maps this working directory to an
-            # agent whose SOUL/RULES/DUTIES/memory join the system prompt and
-            # whose enforcement.disallowed_tools join the denial list.
-            resolver = getattr(self, "topic_agent_resolver", None)
-            if resolver and bool(getattr(self.config, "agent_loader_enabled", True)):
-                try:
-                    topic_agent = resolver(Path(working_directory))
-                except Exception as exc:  # noqa: BLE001 — never fail the turn
-                    logger.warning("Topic agent resolver failed", error=str(exc))
-                    topic_agent = None
-                if topic_agent:
-                    from ..dispatcher.agent_loader import load_agent
+            # callers that know their topic's declared agent (the Telegram
+            # message path via _thread_context) pass it explicitly. Never
+            # inferred from working_directory — the topic dirs are symlinks
+            # that resolve to one checkout, and session state can rewrite the
+            # working dir, so path-keying misidentifies the topic (live
+            # incident 2026-09-04: Relationships session booted as coach and
+            # had every Missive tool denied).
+            if topic_agent and bool(
+                getattr(self.config, "agent_loader_enabled", True)
+            ):
+                from ..dispatcher.agent_loader import load_agent
 
-                    identity, topic_denied = load_agent(
-                        topic_agent, Path(working_directory)
+                identity, topic_denied = load_agent(
+                    topic_agent, Path(working_directory)
+                )
+                if identity:
+                    base_prompt += "\n\n" + identity
+                if topic_denied:
+                    enforcement = str(
+                        getattr(self.config, "agent_tool_enforcement", "enforce")
                     )
-                    if identity:
-                        base_prompt += "\n\n" + identity
-                    if topic_denied:
-                        enforcement = str(
-                            getattr(self.config, "agent_tool_enforcement", "enforce")
+                    if enforcement == "enforce":
+                        extra_disallowed_tools = [
+                            *(extra_disallowed_tools or []),
+                            *topic_denied,
+                        ]
+                    else:
+                        logger.warning(
+                            "Topic agent tool denials in warn mode; NOT enforced",
+                            agent=topic_agent,
+                            would_deny=topic_denied,
                         )
-                        if enforcement == "enforce":
-                            extra_disallowed_tools = [
-                                *(extra_disallowed_tools or []),
-                                *topic_denied,
-                            ]
-                        else:
-                            logger.warning(
-                                "Topic agent tool denials in warn mode; NOT enforced",
-                                agent=topic_agent,
-                                would_deny=topic_denied,
-                            )
 
             # When DISABLE_TOOL_VALIDATION=true, pass None for allowed/disallowed
             # tools so the SDK does not restrict tool usage (e.g. MCP tools).

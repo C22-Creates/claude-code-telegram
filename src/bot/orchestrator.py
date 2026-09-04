@@ -259,6 +259,7 @@ class MessageOrchestrator:
             "project_slug": project.slug,
             "project_root": str(project_root),
             "project_name": project.name,
+            "project_agent": getattr(project, "agent", "") or "",
         }
         return True
 

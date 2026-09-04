@@ -36,3 +36,18 @@ def scope_key_from_context(context: Any) -> Optional[str]:
         return None
 
     return f"{CHAT_SCOPE_PREFIX}:{chat_id}:{thread_id}"
+
+
+def topic_agent_from_context(context: Any) -> Optional[str]:
+    """Agent persona declared for the topic this update belongs to, if any.
+
+    Set by the orchestrator's project-thread gate (``_thread_context``); the
+    agent name maps to a directory under the repo's ``agents/`` tree and is
+    loaded by the SDK layer (agents/README.md § Loader contract).
+    """
+    try:
+        thread_context = context.user_data.get("_thread_context") or {}
+        agent = str(thread_context.get("project_agent") or "").strip()
+        return agent or None
+    except Exception:  # noqa: BLE001 — never break a message on persona lookup
+        return None

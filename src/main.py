@@ -259,22 +259,6 @@ async def run_application(app: Dict[str, Any]) -> None:
             bot.deps["project_registry"] = registry
             bot.deps["project_threads_manager"] = project_threads_manager
 
-            # Wire per-topic agent identity: topic sessions whose project
-            # declares an `agent` load that agent's definition (matched on
-            # the UNRESOLVED path — the topic dirs are symlinks to one
-            # checkout, so resolving would collapse them all together).
-            def _topic_agent_resolver(wd, _registry=registry):
-                from pathlib import Path as _P
-
-                wd = _P(wd)
-                for p in _registry.list_enabled():
-                    if p.agent and (wd == p.absolute_path or wd.name == p.relative_path.name):
-                        return p.agent
-                return None
-
-            claude_integration.sdk_manager.topic_agent_resolver = (
-                _topic_agent_resolver
-            )
 
             if config.project_threads_mode == "group":
                 if config.project_threads_chat_id is None:
