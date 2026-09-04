@@ -272,7 +272,9 @@ async def run_application(app: Dict[str, Any]) -> None:
                         return p.agent
                 return None
 
-            sdk_manager.topic_agent_resolver = _topic_agent_resolver
+            claude_integration.sdk_manager.topic_agent_resolver = (
+                _topic_agent_resolver
+            )
 
             if config.project_threads_mode == "group":
                 if config.project_threads_chat_id is None:
