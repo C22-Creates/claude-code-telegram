@@ -24,6 +24,10 @@ projects:
     name: Journal
     path: my-os-journal
     enabled: true
+    # Optional: boot this topic's sessions as a named agent. Loads
+    # agents/<agent>/{SOUL,RULES,DUTIES}.md + memory/notes.md from the repo
+    # into the system prompt and applies agent.yaml enforcement.disallowed_tools.
+    agent: coach
 
   - slug: work
     name: Work

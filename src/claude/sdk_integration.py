@@ -430,6 +430,7 @@ class ClaudeSDKManager:
         interrupt_event: Optional[asyncio.Event] = None,
         images: Optional[List[Dict[str, str]]] = None,
         model: Optional[str] = None,
+        extra_disallowed_tools: Optional[List[str]] = None,
     ) -> ClaudeResponse:
         """Execute Claude Code command via SDK."""
         start_time = asyncio.get_event_loop().time()
@@ -462,6 +463,41 @@ class ClaudeSDKManager:
                     path=str(claude_md_path),
                 )
 
+            # Per-topic agent identity (agents/README.md § Loader contract):
+            # a resolver wired at startup maps this working directory to an
+            # agent whose SOUL/RULES/DUTIES/memory join the system prompt and
+            # whose enforcement.disallowed_tools join the denial list.
+            resolver = getattr(self, "topic_agent_resolver", None)
+            if resolver and bool(getattr(self.config, "agent_loader_enabled", True)):
+                try:
+                    topic_agent = resolver(Path(working_directory))
+                except Exception as exc:  # noqa: BLE001 — never fail the turn
+                    logger.warning("Topic agent resolver failed", error=str(exc))
+                    topic_agent = None
+                if topic_agent:
+                    from ..dispatcher.agent_loader import load_agent
+
+                    identity, topic_denied = load_agent(
+                        topic_agent, Path(working_directory)
+                    )
+                    if identity:
+                        base_prompt += "\n\n" + identity
+                    if topic_denied:
+                        enforcement = str(
+                            getattr(self.config, "agent_tool_enforcement", "enforce")
+                        )
+                        if enforcement == "enforce":
+                            extra_disallowed_tools = [
+                                *(extra_disallowed_tools or []),
+                                *topic_denied,
+                            ]
+                        else:
+                            logger.warning(
+                                "Topic agent tool denials in warn mode; NOT enforced",
+                                agent=topic_agent,
+                                would_deny=topic_denied,
+                            )
+
             # When DISABLE_TOOL_VALIDATION=true, pass None for allowed/disallowed
             # tools so the SDK does not restrict tool usage (e.g. MCP tools).
             if self.config.disable_tool_validation:
@@ -470,6 +506,19 @@ class ClaudeSDKManager:
             else:
                 sdk_allowed_tools = self.config.claude_allowed_tools
                 sdk_disallowed_tools = self.config.claude_disallowed_tools
+
+            # Agent-level hard denials (dispatcher loader, agents/scoping.md)
+            # apply even when config-level tool validation is disabled — they
+            # are enforcement policy, not schema validation.
+            if extra_disallowed_tools:
+                sdk_disallowed_tools = [
+                    *(sdk_disallowed_tools or []),
+                    *extra_disallowed_tools,
+                ]
+                logger.info(
+                    "Agent tool denials active",
+                    disallowed=extra_disallowed_tools,
+                )
 
             # Build Claude Agent options
             options = ClaudeAgentOptions(
