@@ -6,6 +6,11 @@ APP_DESCRIPTION = "Telegram bot for remote Claude Code access"
 
 # Default limits
 DEFAULT_CLAUDE_TIMEOUT_SECONDS = 300
+# Max seconds to wait for the *next* SDK message before treating the stream
+# as stalled. Bounds a single hung step (most often an outbound MCP tool
+# call, e.g. a Notion write that never returns) well under the full session
+# budget above, instead of silently spending all of it. See failure mode #39.
+DEFAULT_CLAUDE_TOOL_IDLE_TIMEOUT_SECONDS = 120
 DEFAULT_CLAUDE_MAX_TURNS = 10
 DEFAULT_CLAUDE_MAX_COST_PER_USER = 10.0
 DEFAULT_CLAUDE_MAX_COST_PER_REQUEST = 5.0

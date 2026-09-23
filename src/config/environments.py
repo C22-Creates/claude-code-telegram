@@ -33,6 +33,7 @@ class TestingConfig:
     approved_directory: str = "/tmp/test_projects"
     enable_telemetry: bool = False
     claude_timeout_seconds: int = 30  # Faster timeout for tests
+    claude_tool_idle_timeout_seconds: int = 10  # Must stay < claude_timeout_seconds
     rate_limit_requests: int = 1000  # No rate limiting in tests
     session_timeout_hours: int = 1  # Short session timeout for testing
 
