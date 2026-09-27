@@ -14,6 +14,7 @@ from claude_agent_sdk import (
     ResultMessage,
     TextBlock,
     ToolPermissionContext,
+    ToolUseBlock,
 )
 from claude_agent_sdk.types import StreamEvent
 
@@ -474,6 +475,163 @@ class TestClaudeSDKManager:
     def test_is_retryable_error_timeout(self, sdk_manager):
         """Test _is_retryable_error returns False for timeout errors."""
         assert sdk_manager._is_retryable_error(asyncio.TimeoutError()) is False
+
+
+class TestStreamStallDetection:
+    """A stalled tool call must fail fast, not silently burn the full session budget.
+
+    Regression guard for failure mode #39: a completed, self-screened
+    content-draft blocked for ~28 of a 30-minute budget on two unanswered
+    mcp__notion__notion-update-page calls, with zero visible progress and no
+    signal until the outer claude_timeout_seconds finally fired.
+    """
+
+    @pytest.fixture
+    def config(self, tmp_path):
+        return Settings(
+            telegram_bot_token="test:token",
+            telegram_bot_username="testbot",
+            approved_directory=tmp_path,
+            claude_timeout_seconds=10,
+            claude_tool_idle_timeout_seconds=1,
+            enable_mcp=False,
+        )
+
+    @pytest.fixture
+    def sdk_manager(self, config):
+        return ClaudeSDKManager(config)
+
+    @staticmethod
+    def _client_that_hangs_after(*messages):
+        """A mock client whose stream yields *messages* then goes silent forever."""
+        client = AsyncMock()
+        client.connect = AsyncMock()
+        client.disconnect = AsyncMock()
+        client.query = AsyncMock()
+
+        async def receive_then_hang():
+            for msg in messages:
+                yield msg
+            await asyncio.sleep(300)  # far past idle_timeout=1 and timeout=10
+            yield  # pragma: no cover — never reached
+
+        query_mock = AsyncMock()
+        query_mock.receive_messages = receive_then_hang
+        client._query = query_mock
+        return client
+
+    async def test_stalled_tool_call_raises_well_before_session_timeout(
+        self, sdk_manager
+    ):
+        """A hung tool call must be caught by the idle watchdog, not the 10s ceiling."""
+        from src.claude.exceptions import ClaudeStreamStalledError
+
+        tool_use_message = AssistantMessage(
+            content=[
+                ToolUseBlock(
+                    id="toolu_1",
+                    name="mcp__notion__notion-update-page",
+                    input={"content": "the fully composed draft"},
+                )
+            ],
+            model="claude-sonnet-4-20250514",
+        )
+        client = self._client_that_hangs_after(tool_use_message)
+
+        with patch("src.claude.sdk_integration.ClaudeSDKClient", return_value=client):
+            loop = asyncio.get_event_loop()
+            started = loop.time()
+            with pytest.raises(ClaudeStreamStalledError) as exc_info:
+                await sdk_manager.execute_command(
+                    prompt="Test prompt",
+                    working_directory=Path("/test"),
+                )
+            elapsed = loop.time() - started
+
+        # The whole point: fires near idle_timeout (1s), nowhere near the
+        # 10s session ceiling that would otherwise be the only backstop.
+        assert (
+            elapsed < 5
+        ), f"stall should fire near idle_timeout, not claude_timeout_seconds ({elapsed:.2f}s)"
+        assert exc_info.value.last_tool_name == "mcp__notion__notion-update-page"
+
+    async def test_stalled_tool_call_is_a_timeout_error(self, sdk_manager):
+        """ClaudeStreamStalledError must be a ClaudeTimeoutError.
+
+        facade.py special-cases ClaudeTimeoutError to preserve the session
+        for retry instead of discarding it; the Telegram handler shows the
+        actionable "Request Timeout" message. A stalled tool call deserves
+        the same treatment as a slow turn, not silent loss of the session.
+        """
+        from src.claude.exceptions import ClaudeTimeoutError
+
+        client = self._client_that_hangs_after()  # stalls with no tool in flight
+
+        with patch("src.claude.sdk_integration.ClaudeSDKClient", return_value=client):
+            with pytest.raises(ClaudeTimeoutError) as exc_info:
+                await sdk_manager.execute_command(
+                    prompt="Test prompt",
+                    working_directory=Path("/test"),
+                )
+
+        # No tool call was ever in flight, so the watcher can't attribute the
+        # stall to one — the raiser falls back to "unknown" rather than None
+        # so the message always names *something* the log can be grepped for.
+        assert exc_info.value.last_tool_name == "unknown"
+
+    async def test_active_progress_does_not_trigger_stall(self, sdk_manager):
+        """A slow-but-progressing stream must not be mistaken for a stall.
+
+        Each message arrives well inside idle_timeout of the previous one,
+        even though the whole exchange comfortably exceeds idle_timeout.
+        """
+        client = AsyncMock()
+        client.connect = AsyncMock()
+        client.disconnect = AsyncMock()
+        client.query = AsyncMock()
+
+        async def slow_but_steady():
+            for i in range(3):
+                await asyncio.sleep(0.4)  # well under idle_timeout=1
+                yield _make_assistant_message(f"progress {i}")
+            await asyncio.sleep(0.4)
+            yield _make_result_message()
+
+        query_mock = AsyncMock()
+        query_mock.receive_messages = slow_but_steady
+        client._query = query_mock
+
+        with patch("src.claude.sdk_integration.ClaudeSDKClient", return_value=client):
+            response = await sdk_manager.execute_command(
+                prompt="Test prompt",
+                working_directory=Path("/test"),
+            )
+
+        assert not response.is_error
+
+    def test_last_tool_name_returns_most_recent_tool_use(self):
+        older = AssistantMessage(
+            content=[ToolUseBlock(id="t1", name="Read", input={})],
+            model="claude-sonnet-4-20250514",
+        )
+        newer = AssistantMessage(
+            content=[
+                ToolUseBlock(id="t2", name="mcp__notion__notion-update-page", input={})
+            ],
+            model="claude-sonnet-4-20250514",
+        )
+
+        assert (
+            ClaudeSDKManager._last_tool_name([older, newer])
+            == "mcp__notion__notion-update-page"
+        )
+
+    def test_last_tool_name_none_when_no_tool_use(self):
+        text_only = _make_assistant_message("just talking")
+        assert ClaudeSDKManager._last_tool_name([text_only]) is None
+
+    def test_last_tool_name_empty_messages(self):
+        assert ClaudeSDKManager._last_tool_name([]) is None
 
 
 class TestClaudeSandboxSettings:

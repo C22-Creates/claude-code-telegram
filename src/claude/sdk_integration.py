@@ -37,6 +37,7 @@ from .exceptions import (
     ClaudeMCPError,
     ClaudeParsingError,
     ClaudeProcessError,
+    ClaudeStreamStalledError,
     ClaudeTimeoutError,
 )
 from .monitor import _is_claude_internal_path, check_bash_directory_boundary
@@ -327,6 +328,25 @@ class ClaudeSDKManager:
             )
             return False
         return True
+
+    @staticmethod
+    def _last_tool_name(messages: List[Message]) -> Optional[str]:
+        """Return the tool name from the most recent ToolUseBlock, if any.
+
+        Diagnostic-only: used to attribute a stream stall to the tool call
+        that was in flight when it happened, since the stream going quiet
+        right after a ToolUseBlock is, in practice, a hung outbound call
+        (e.g. an MCP write that never returns) rather than a slow model
+        turn. See failure mode #39.
+        """
+        for message in reversed(messages):
+            if isinstance(message, AssistantMessage):
+                content = getattr(message, "content", [])
+                if isinstance(content, list):
+                    for block in reversed(content):
+                        if isinstance(block, ToolUseBlock):
+                            return block.name
+        return None
 
     @staticmethod
     def _descendant_pids(root_pid: int) -> List[int]:
@@ -641,6 +661,7 @@ class ClaudeSDKManager:
             # Execute with timeout and retry, racing against optional interrupt
             max_attempts = max(1, self.config.claude_retry_max_attempts)
             last_exc: Optional[BaseException] = None
+            idle_timeout = self.config.claude_tool_idle_timeout_seconds
 
             for attempt in range(max_attempts):
                 # Reset message accumulator each attempt so that a failed attempt
@@ -648,6 +669,7 @@ class ClaudeSDKManager:
                 # _run_client() closes over `messages` by reference (late-binding
                 # closure), so clearing it here is seen by every new call.
                 messages.clear()
+                stalled_tool_name: Optional[str] = None
 
                 if attempt > 0:
                     delay = min(
@@ -676,8 +698,50 @@ class ClaudeSDKManager:
 
                     interrupt_watcher = asyncio.create_task(_cancel_on_interrupt())
 
+                async def _cancel_on_stall() -> None:
+                    # Watches `messages` (appended to by _run_client as it
+                    # streams) for growth. No growth for idle_timeout seconds
+                    # means the stream is stalled — in practice almost always
+                    # a hung outbound tool call, e.g. an MCP write that never
+                    # returns (failure mode #39) — and would otherwise
+                    # silently burn the full claude_timeout_seconds budget
+                    # with zero visible progress. Sets stalled_tool_name
+                    # *before* cancelling, so the CancelledError handler below
+                    # can never observe the cancellation without the reason
+                    # already recorded.
+                    nonlocal stalled_tool_name
+                    loop = asyncio.get_event_loop()
+                    last_count = 0
+                    last_seen_at = loop.time()
+                    while not run_task.done():
+                        await asyncio.sleep(1.0)
+                        if run_task.done():
+                            return
+                        current_count = len(messages)
+                        now = loop.time()
+                        if current_count != last_count:
+                            last_count = current_count
+                            last_seen_at = now
+                            continue
+                        if now - last_seen_at >= idle_timeout:
+                            stalled_tool_name = (
+                                self._last_tool_name(messages) or "unknown"
+                            )
+                            logger.error(
+                                "Claude SDK message stream stalled",
+                                idle_timeout_seconds=idle_timeout,
+                                last_tool_name=stalled_tool_name,
+                            )
+                            run_task.cancel()
+                            return
+
+                stall_watcher = asyncio.create_task(_cancel_on_stall())
+
                 # Note: asyncio.TimeoutError is intentionally NOT retried —
-                # it reflects a user-configured hard limit.
+                # it reflects a user-configured hard limit. A stream stall
+                # (below) isn't retried either — the underlying tool call may
+                # still be in flight server-side, so retrying immediately
+                # would just risk a second concurrent write.
                 try:
                     await asyncio.wait_for(
                         asyncio.shield(run_task),
@@ -685,6 +749,15 @@ class ClaudeSDKManager:
                     )
                     break  # success — exit retry loop
                 except asyncio.CancelledError:
+                    if stalled_tool_name is not None:
+                        if not await self._await_cancelled(
+                            run_task, reason="claude_stream_stalled"
+                        ):
+                            self._reap_wedged_child(
+                                client_holder.get("client"),
+                                reason="claude_stream_stalled",
+                            )
+                        raise ClaudeStreamStalledError(stalled_tool_name, idle_timeout)
                     if not interrupted:
                         raise
                     # Interrupt cancelled the task — wait for cleanup, but do
@@ -731,6 +804,7 @@ class ClaudeSDKManager:
                         continue
                     raise  # non-retryable or attempts exhausted
                 finally:
+                    stall_watcher.cancel()
                     if interrupt_watcher is not None:
                         interrupt_watcher.cancel()
             else:
@@ -841,6 +915,15 @@ class ClaudeSDKManager:
             raise ClaudeTimeoutError(
                 f"Claude SDK timed out after {self.config.claude_timeout_seconds}s"
             )
+
+        except ClaudeTimeoutError:
+            # Already a well-typed, well-messaged error raised by the retry
+            # loop above (including ClaudeStreamStalledError) — pass through
+            # unchanged instead of falling into the generic Exception handler
+            # below, which would re-wrap it as an opaque ClaudeProcessError
+            # and lose both the specific type callers dispatch on (facade.py
+            # preserves the session for retry) and the actionable message.
+            raise
 
         except CLINotFoundError as e:
             logger.error("Claude CLI not found", error=str(e))

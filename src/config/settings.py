@@ -12,6 +12,7 @@ import json
 from pathlib import Path
 from typing import Any, List, Literal, Optional
 
+import structlog
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -20,6 +21,7 @@ from src.utils.constants import (
     DEFAULT_CLAUDE_MAX_COST_PER_USER,
     DEFAULT_CLAUDE_MAX_TURNS,
     DEFAULT_CLAUDE_TIMEOUT_SECONDS,
+    DEFAULT_CLAUDE_TOOL_IDLE_TIMEOUT_SECONDS,
     DEFAULT_DATABASE_URL,
     DEFAULT_MAX_SESSIONS_PER_USER,
     DEFAULT_PROJECT_THREADS_SYNC_ACTION_INTERVAL_SECONDS,
@@ -32,6 +34,8 @@ from src.utils.constants import (
     DEFAULT_RETRY_MAX_DELAY,
     DEFAULT_SESSION_TIMEOUT_HOURS,
 )
+
+logger = structlog.get_logger()
 
 
 class Settings(BaseSettings):
@@ -86,6 +90,16 @@ class Settings(BaseSettings):
     )
     claude_timeout_seconds: int = Field(
         DEFAULT_CLAUDE_TIMEOUT_SECONDS, description="Claude timeout"
+    )
+    claude_tool_idle_timeout_seconds: int = Field(
+        DEFAULT_CLAUDE_TOOL_IDLE_TIMEOUT_SECONDS,
+        gt=0,
+        description=(
+            "Max seconds to wait for the next SDK message before treating the "
+            "stream as stalled — catches a single hung step (most often an "
+            "outbound MCP tool call) without spending the whole "
+            "claude_timeout_seconds budget on it. Must be < claude_timeout_seconds."
+        ),
     )
     claude_max_cost_per_user: float = Field(
         DEFAULT_CLAUDE_MAX_COST_PER_USER, description="Max cost per user"
@@ -524,6 +538,22 @@ class Settings(BaseSettings):
         # Check MCP requirements
         if self.enable_mcp and not self.mcp_config_path:
             raise ValueError("mcp_config_path required when enable_mcp is True")
+
+        # A stall watchdog that can't fire before the session timeout is a
+        # silent no-op. Clamp rather than raise: many configs (tests among
+        # them) set a short claude_timeout_seconds without also tuning this,
+        # and clamping keeps the invariant true unconditionally instead of
+        # relying on every caller to hold it by convention.
+        if self.claude_tool_idle_timeout_seconds >= self.claude_timeout_seconds:
+            clamped = max(1, self.claude_timeout_seconds - 1)
+            logger.warning(
+                "claude_tool_idle_timeout_seconds clamped: was >= "
+                "claude_timeout_seconds and could never fire",
+                configured=self.claude_tool_idle_timeout_seconds,
+                claude_timeout_seconds=self.claude_timeout_seconds,
+                clamped_to=clamped,
+            )
+            self.claude_tool_idle_timeout_seconds = clamped
 
         if self.enable_project_threads:
             if (

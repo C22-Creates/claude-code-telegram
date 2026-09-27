@@ -70,6 +70,12 @@ CLAUDE_MAX_TURNS=10
 # Timeout for Claude operations in seconds
 CLAUDE_TIMEOUT_SECONDS=300
 
+# Max seconds to wait for the next SDK message before treating the stream as
+# stalled (catches a single hung step, most often an outbound MCP tool call,
+# without spending the whole CLAUDE_TIMEOUT_SECONDS budget on it). Must be
+# less than CLAUDE_TIMEOUT_SECONDS.
+CLAUDE_TOOL_IDLE_TIMEOUT_SECONDS=120
+
 # Maximum cost per user in USD (lifetime budget for rate limiter)
 CLAUDE_MAX_COST_PER_USER=10.0
 

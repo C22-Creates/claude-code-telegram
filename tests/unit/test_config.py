@@ -47,6 +47,36 @@ def test_settings_with_valid_data(tmp_path):
     assert settings.approved_directory == test_dir
 
 
+def test_claude_tool_idle_timeout_defaults_below_session_timeout(tmp_path):
+    """The idle-stall watchdog default must actually be able to fire."""
+    settings = Settings(
+        telegram_bot_token="test_token",
+        telegram_bot_username="test_bot",
+        approved_directory=str(tmp_path),
+    )
+
+    assert settings.claude_tool_idle_timeout_seconds < settings.claude_timeout_seconds
+
+
+def test_claude_tool_idle_timeout_clamped_when_not_below_session_timeout(tmp_path):
+    """An idle timeout >= the session timeout could never fire — clamp it.
+
+    Regression guard for failure mode #39's fix: a config that only shortens
+    claude_timeout_seconds (a common pattern in fast test/dev configs)
+    must not silently leave the watchdog permanently unable to trigger.
+    """
+    settings = Settings(
+        telegram_bot_token="test_token",
+        telegram_bot_username="test_bot",
+        approved_directory=str(tmp_path),
+        claude_timeout_seconds=5,
+        claude_tool_idle_timeout_seconds=120,
+    )
+
+    assert settings.claude_tool_idle_timeout_seconds < settings.claude_timeout_seconds
+    assert settings.claude_tool_idle_timeout_seconds == 4
+
+
 def test_allowed_users_parsing():
     """Test parsing of comma-separated user IDs."""
     with tempfile.TemporaryDirectory() as tmp_dir:

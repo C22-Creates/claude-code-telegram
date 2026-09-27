@@ -5,6 +5,7 @@ from .exceptions import (
     ClaudeParsingError,
     ClaudeProcessError,
     ClaudeSessionError,
+    ClaudeStreamStalledError,
     ClaudeTimeoutError,
 )
 from .facade import ClaudeIntegration
@@ -21,6 +22,7 @@ __all__ = [
     "ClaudeParsingError",
     "ClaudeProcessError",
     "ClaudeSessionError",
+    "ClaudeStreamStalledError",
     "ClaudeTimeoutError",
     # Main integration
     "ClaudeIntegration",
