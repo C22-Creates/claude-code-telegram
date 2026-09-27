@@ -149,3 +149,4 @@ uploads/
 config/mcp.json
 # Per-install project/topic config (keep local, sync via syncthing)
 config/projects.yaml
+.gstack/
