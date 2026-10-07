@@ -8,7 +8,9 @@ Features:
 """
 
 import asyncio
+import os
 from typing import Any, Callable, Dict, Optional
+from urllib.parse import urlparse, urlunparse
 
 import structlog
 from telegram import Update
@@ -27,6 +29,28 @@ from .features.registry import FeatureRegistry
 from .orchestrator import MessageOrchestrator
 
 logger = structlog.get_logger()
+
+
+def _redact_proxy_url(proxy_url: str) -> str:
+    """Mask the password in a proxy URL so it is safe to log.
+
+    ``HTTPS_PROXY``/``HTTP_PROXY`` commonly carry credentials as
+    ``scheme://user:pass@host:port``. Logging the URL verbatim writes that
+    password into the structured logs in plaintext, so replace it with
+    ``***`` while keeping the scheme, user and host readable.
+    """
+    try:
+        parsed = urlparse(proxy_url)
+    except ValueError:
+        # Never let a malformed proxy URL reach the logs unmasked.
+        return "<unparsable proxy URL>"
+
+    if not parsed.password:
+        return proxy_url
+
+    userinfo, _, hostport = parsed.netloc.rpartition("@")
+    username = userinfo.split(":", 1)[0]
+    return urlunparse(parsed._replace(netloc=f"{username}:***@{hostport}"))
 
 
 class ClaudeCodeBot:
@@ -64,17 +88,24 @@ class ClaudeCodeBot:
         builder.write_timeout(30)
         builder.pool_timeout(30)
 
+        # Long polling uses a separate HTTP client whose connection pool holds a
+        # single connection by default. If a long-running getUpdates request is
+        # torn down mid-flight (unstable network, proxy or tunnel drop), that
+        # connection can stay checked out, and every later getUpdates call then
+        # fails with "Pool timeout: All connections in the connection pool are
+        # occupied", permanently, even after the network recovers. A small pool
+        # leaves headroom so polling can recover on its own.
+        builder.get_updates_connection_pool_size(8)
+
         # Explicitly set proxy from environment variables.
         # This is necessary because python-telegram-bot's Application.builder()
         # does not automatically use HTTP_PROXY/HTTPS_PROXY environment variables.
         # Without this, the httpx connection pool can become corrupted when running
         # behind a proxy, causing the bot to stop responding to messages.
-        import os
-
         proxy_url = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY")
         if proxy_url:
             builder.proxy(proxy_url)
-            logger.info("Proxy configured", proxy=proxy_url)
+            logger.info("Proxy configured", proxy=_redact_proxy_url(proxy_url))
 
         self.app = builder.build()
 
@@ -212,8 +243,10 @@ class ClaudeCodeBot:
             self.is_running = True
 
             if self.settings.webhook_url:
-                # Webhook mode
-                await self.app.run_webhook(
+                # Webhook mode - use start/start_webhook instead of run_webhook
+                # to avoid "Cannot close a running event loop" in async context
+                await self.app.start()
+                await self.app.updater.start_webhook(
                     listen="0.0.0.0",
                     port=self.settings.webhook_port,
                     url_path=self.settings.webhook_path,
@@ -221,6 +254,10 @@ class ClaudeCodeBot:
                     drop_pending_updates=True,
                     allowed_updates=Update.ALL_TYPES,
                 )
+
+                # Keep running until manually stopped
+                while self.is_running:
+                    await asyncio.sleep(1)
             else:
                 # Polling mode - initialize and start polling manually
                 await self.app.initialize()

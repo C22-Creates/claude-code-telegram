@@ -45,24 +45,24 @@ Choose your preferred method:
 
 ```bash
 # Using uv (recommended — installs in an isolated environment)
-uv tool install git+https://github.com/RichardAtCT/claude-code-telegram@v1.3.0
+uv tool install git+https://github.com/overwirehq/claude-code-telegram@v1.3.0
 
 # Or using pip
-pip install git+https://github.com/RichardAtCT/claude-code-telegram@v1.3.0
+pip install git+https://github.com/overwirehq/claude-code-telegram@v1.3.0
 
 # Track the latest stable release
-pip install git+https://github.com/RichardAtCT/claude-code-telegram@latest
+pip install git+https://github.com/overwirehq/claude-code-telegram@latest
 ```
 
 #### Option B: From source (for development)
 
 ```bash
-git clone https://github.com/RichardAtCT/claude-code-telegram.git
+git clone https://github.com/overwirehq/claude-code-telegram.git
 cd claude-code-telegram
 make dev  # requires Poetry
 ```
 
-> **Note:** Always install from a tagged release (not `main`) for stability. See [Releases](https://github.com/RichardAtCT/claude-code-telegram/releases) for available versions.
+> **Note:** Always install from a tagged release (not `main`) for stability. See [Releases](https://github.com/overwirehq/claude-code-telegram/releases) for available versions.
 
 ### 3. Configure
 
@@ -357,9 +357,11 @@ Each command commits, tags, and pushes automatically, triggering CI tests and a 
 1. Fork the repository
 2. Create a feature branch: `git checkout -b feature/amazing-feature`
 3. Make changes with tests: `make test && make lint`
-4. Submit a Pull Request
+4. Submit a Pull Request (one feature or fix per PR, with tests)
 
-**Code standards:** Python 3.11+, Black formatting (88 chars), type hints required, pytest with >85% coverage.
+**Code standards:** Python 3.11+, Black formatting (88 chars), type hints required, pytest.
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the full process, [MAINTAINERS.md](MAINTAINERS.md) for who reviews and how to become a maintainer, [docs/ROADMAP-v2.md](docs/ROADMAP-v2.md) for what is planned, and [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) for community expectations.
 
 ## License
 
@@ -367,7 +369,7 @@ MIT License -- see [LICENSE](LICENSE).
 
 ## Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=RichardAtCT/claude-code-telegram&type=Date)](https://star-history.com/#RichardAtCT/claude-code-telegram&Date)
+[![Star History Chart](https://api.star-history.com/svg?repos=overwirehq/claude-code-telegram&type=Date)](https://star-history.com/#overwirehq/claude-code-telegram&Date)
 
 ## Acknowledgments
 
