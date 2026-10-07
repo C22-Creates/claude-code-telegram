@@ -6,6 +6,11 @@ APP_DESCRIPTION = "Telegram bot for remote Claude Code access"
 
 # Default limits
 DEFAULT_CLAUDE_TIMEOUT_SECONDS = 300
+# Max seconds to wait for the *next* SDK message before treating the stream
+# as stalled. Bounds a single hung step (most often an outbound MCP tool
+# call, e.g. a Notion write that never returns) well under the full session
+# budget above, instead of silently spending all of it. See failure mode #39.
+DEFAULT_CLAUDE_TOOL_IDLE_TIMEOUT_SECONDS = 120
 DEFAULT_CLAUDE_MAX_TURNS = 10
 DEFAULT_CLAUDE_MAX_COST_PER_USER = 10.0
 DEFAULT_CLAUDE_MAX_COST_PER_REQUEST = 5.0
@@ -17,6 +22,20 @@ DEFAULT_PROJECT_THREADS_SYNC_ACTION_INTERVAL_SECONDS = 1.1
 
 DEFAULT_SESSION_TIMEOUT_HOURS = 24
 DEFAULT_MAX_SESSIONS_PER_USER = 5
+
+# Identity used for autonomous background work (Hermes dispatcher tasks and
+# scheduled/webhook jobs). Background work is stateless by design — each task
+# gets a fresh session — so it must NOT share a human's session pool, where its
+# churn would evict live conversations. Keeping it distinct also separates cost
+# and audit attribution between "Carl talking" and "the machine working".
+SYSTEM_USER_ID = 0
+SYSTEM_USER_NAME = "system"
+
+# Session scope keys for background work. Chat sessions use
+# "chat:<chat_id>:<thread_id>" so each Telegram topic keeps its own thread.
+SCOPE_HERMES = "hermes"
+SCOPE_SCHEDULER = "scheduler"
+SCOPE_WEBHOOK = "webhook"
 
 # Message limits
 TELEGRAM_MAX_MESSAGE_LENGTH = 4096

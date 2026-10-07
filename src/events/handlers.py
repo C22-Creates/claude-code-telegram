@@ -4,12 +4,15 @@ AgentHandler: translates events into ClaudeIntegration.run_command() calls.
 NotificationHandler: subscribes to AgentResponseEvent and delivers to Telegram.
 """
 
+import asyncio
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Set
 
 import structlog
 
+from ..bot.utils.formatting import with_stop_reason
 from ..claude.facade import ClaudeIntegration
+from ..utils.constants import SCOPE_SCHEDULER, SCOPE_WEBHOOK, SYSTEM_USER_ID
 from .bus import Event, EventBus
 from .types import AgentResponseEvent, ScheduledEvent, WebhookEvent
 
@@ -29,12 +32,14 @@ class AgentHandler:
         event_bus: EventBus,
         claude_integration: ClaudeIntegration,
         default_working_directory: Path,
-        default_user_id: int = 0,
+        default_user_id: int = SYSTEM_USER_ID,
     ) -> None:
         self.event_bus = event_bus
         self.claude = claude_integration
         self.default_working_directory = default_working_directory
         self.default_user_id = default_user_id
+        self._scheduled_semaphore = asyncio.Semaphore(2)
+        self._background_tasks: Set[asyncio.Task[Any]] = set()
 
     def register(self) -> None:
         """Subscribe to events that need agent processing."""
@@ -60,9 +65,15 @@ class AgentHandler:
                 prompt=prompt,
                 working_directory=self.default_working_directory,
                 user_id=self.default_user_id,
+                force_new=True,
+                scope_key=SCOPE_WEBHOOK,
             )
 
-            if response.content:
+            # Nobody is watching a webhook run, so the reason it stopped is
+            # the whole of what the notification can say about it (#172).
+            text = with_stop_reason(response)
+
+            if text:
                 # We don't know which chat to send to from a webhook alone.
                 # The notification service needs configured target chats.
                 # Publish with chat_id=0 — the NotificationService
@@ -70,7 +81,7 @@ class AgentHandler:
                 await self.event_bus.publish(
                     AgentResponseEvent(
                         chat_id=0,
-                        text=response.content,
+                        text=text,
                         originating_event_id=event.id,
                     )
                 )
@@ -92,27 +103,48 @@ class AgentHandler:
             job_name=event.job_name,
         )
 
-        prompt = event.prompt
-        if event.skill_name:
-            prompt = (
-                f"/{event.skill_name}\n\n{prompt}" if prompt else f"/{event.skill_name}"
-            )
+        task = asyncio.create_task(
+            self._run_scheduled(event),
+            name=f"scheduled:{event.job_id or event.job_name or event.id}",
+        )
+        self._background_tasks.add(task)
+        task.add_done_callback(self._task_done)
+        await asyncio.sleep(0)
 
-        working_dir = event.working_directory or self.default_working_directory
+    async def _run_scheduled(self, event: ScheduledEvent) -> None:
+        """Run scheduled Claude work in the background with concurrency limits."""
+        async with self._scheduled_semaphore:
+            prompt = event.prompt
+            if event.skill_name:
+                prompt = (
+                    f"/{event.skill_name}\n\n{prompt}"
+                    if prompt
+                    else f"/{event.skill_name}"
+                )
 
-        try:
+            working_dir = event.working_directory or self.default_working_directory
+
             response = await self.claude.run_command(
                 prompt=prompt,
                 working_directory=working_dir,
                 user_id=self.default_user_id,
+                # A cron run is a self-contained unit of work, like a board
+                # task. It already behaved this way in practice — every run
+                # started fresh because its predecessor had been evicted from
+                # the shared pool — so this makes the intent explicit rather
+                # than leaving it to eviction timing.
+                force_new=True,
+                scope_key=SCOPE_SCHEDULER,
             )
 
-            if response.content:
+            text = with_stop_reason(response)
+
+            if text:
                 for chat_id in event.target_chat_ids:
                     await self.event_bus.publish(
                         AgentResponseEvent(
                             chat_id=chat_id,
-                            text=response.content,
+                            text=text,
                             message_thread_id=event.message_thread_id,
                             originating_event_id=event.id,
                         )
@@ -123,16 +155,23 @@ class AgentHandler:
                     await self.event_bus.publish(
                         AgentResponseEvent(
                             chat_id=0,
-                            text=response.content,
+                            text=text,
                             message_thread_id=event.message_thread_id,
                             originating_event_id=event.id,
                         )
                     )
+
+    def _task_done(self, task: asyncio.Task[Any]) -> None:
+        """Clean up finished scheduled tasks and log failures."""
+        self._background_tasks.discard(task)
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            return
         except Exception:
             logger.exception(
                 "Agent execution failed for scheduled event",
-                job_id=event.job_id,
-                event_id=event.id,
+                task_name=task.get_name(),
             )
 
     def _build_webhook_prompt(self, event: WebhookEvent) -> str:

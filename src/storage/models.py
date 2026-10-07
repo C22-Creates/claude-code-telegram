@@ -73,6 +73,7 @@ class SessionModel:
     total_turns: int = 0
     message_count: int = 0
     is_active: bool = True
+    scope_key: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""

@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import time
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -13,10 +14,14 @@ from claude_agent_sdk import (
     ResultMessage,
     TextBlock,
     ToolPermissionContext,
+    ToolUseBlock,
 )
 from claude_agent_sdk.types import StreamEvent
 
 from src.claude.sdk_integration import (
+    GUARDED_TOOLS,
+    TASK_COMPLETED_MSG,
+    TASK_STOPPED_MSG,
     ClaudeResponse,
     ClaudeSDKManager,
     StreamUpdate,
@@ -475,6 +480,163 @@ class TestClaudeSDKManager:
         assert sdk_manager._is_retryable_error(asyncio.TimeoutError()) is False
 
 
+class TestStreamStallDetection:
+    """A stalled tool call must fail fast, not silently burn the full session budget.
+
+    Regression guard for failure mode #39: a completed, self-screened
+    content-draft blocked for ~28 of a 30-minute budget on two unanswered
+    mcp__notion__notion-update-page calls, with zero visible progress and no
+    signal until the outer claude_timeout_seconds finally fired.
+    """
+
+    @pytest.fixture
+    def config(self, tmp_path):
+        return Settings(
+            telegram_bot_token="test:token",
+            telegram_bot_username="testbot",
+            approved_directory=tmp_path,
+            claude_timeout_seconds=10,
+            claude_tool_idle_timeout_seconds=1,
+            enable_mcp=False,
+        )
+
+    @pytest.fixture
+    def sdk_manager(self, config):
+        return ClaudeSDKManager(config)
+
+    @staticmethod
+    def _client_that_hangs_after(*messages):
+        """A mock client whose stream yields *messages* then goes silent forever."""
+        client = AsyncMock()
+        client.connect = AsyncMock()
+        client.disconnect = AsyncMock()
+        client.query = AsyncMock()
+
+        async def receive_then_hang():
+            for msg in messages:
+                yield msg
+            await asyncio.sleep(300)  # far past idle_timeout=1 and timeout=10
+            yield  # pragma: no cover — never reached
+
+        query_mock = AsyncMock()
+        query_mock.receive_messages = receive_then_hang
+        client._query = query_mock
+        return client
+
+    async def test_stalled_tool_call_raises_well_before_session_timeout(
+        self, sdk_manager
+    ):
+        """A hung tool call must be caught by the idle watchdog, not the 10s ceiling."""
+        from src.claude.exceptions import ClaudeStreamStalledError
+
+        tool_use_message = AssistantMessage(
+            content=[
+                ToolUseBlock(
+                    id="toolu_1",
+                    name="mcp__notion__notion-update-page",
+                    input={"content": "the fully composed draft"},
+                )
+            ],
+            model="claude-sonnet-4-20250514",
+        )
+        client = self._client_that_hangs_after(tool_use_message)
+
+        with patch("src.claude.sdk_integration.ClaudeSDKClient", return_value=client):
+            loop = asyncio.get_event_loop()
+            started = loop.time()
+            with pytest.raises(ClaudeStreamStalledError) as exc_info:
+                await sdk_manager.execute_command(
+                    prompt="Test prompt",
+                    working_directory=Path("/test"),
+                )
+            elapsed = loop.time() - started
+
+        # The whole point: fires near idle_timeout (1s), nowhere near the
+        # 10s session ceiling that would otherwise be the only backstop.
+        assert (
+            elapsed < 5
+        ), f"stall should fire near idle_timeout, not claude_timeout_seconds ({elapsed:.2f}s)"
+        assert exc_info.value.last_tool_name == "mcp__notion__notion-update-page"
+
+    async def test_stalled_tool_call_is_a_timeout_error(self, sdk_manager):
+        """ClaudeStreamStalledError must be a ClaudeTimeoutError.
+
+        facade.py special-cases ClaudeTimeoutError to preserve the session
+        for retry instead of discarding it; the Telegram handler shows the
+        actionable "Request Timeout" message. A stalled tool call deserves
+        the same treatment as a slow turn, not silent loss of the session.
+        """
+        from src.claude.exceptions import ClaudeTimeoutError
+
+        client = self._client_that_hangs_after()  # stalls with no tool in flight
+
+        with patch("src.claude.sdk_integration.ClaudeSDKClient", return_value=client):
+            with pytest.raises(ClaudeTimeoutError) as exc_info:
+                await sdk_manager.execute_command(
+                    prompt="Test prompt",
+                    working_directory=Path("/test"),
+                )
+
+        # No tool call was ever in flight, so the watcher can't attribute the
+        # stall to one — the raiser falls back to "unknown" rather than None
+        # so the message always names *something* the log can be grepped for.
+        assert exc_info.value.last_tool_name == "unknown"
+
+    async def test_active_progress_does_not_trigger_stall(self, sdk_manager):
+        """A slow-but-progressing stream must not be mistaken for a stall.
+
+        Each message arrives well inside idle_timeout of the previous one,
+        even though the whole exchange comfortably exceeds idle_timeout.
+        """
+        client = AsyncMock()
+        client.connect = AsyncMock()
+        client.disconnect = AsyncMock()
+        client.query = AsyncMock()
+
+        async def slow_but_steady():
+            for i in range(3):
+                await asyncio.sleep(0.4)  # well under idle_timeout=1
+                yield _make_assistant_message(f"progress {i}")
+            await asyncio.sleep(0.4)
+            yield _make_result_message()
+
+        query_mock = AsyncMock()
+        query_mock.receive_messages = slow_but_steady
+        client._query = query_mock
+
+        with patch("src.claude.sdk_integration.ClaudeSDKClient", return_value=client):
+            response = await sdk_manager.execute_command(
+                prompt="Test prompt",
+                working_directory=Path("/test"),
+            )
+
+        assert not response.is_error
+
+    def test_last_tool_name_returns_most_recent_tool_use(self):
+        older = AssistantMessage(
+            content=[ToolUseBlock(id="t1", name="Read", input={})],
+            model="claude-sonnet-4-20250514",
+        )
+        newer = AssistantMessage(
+            content=[
+                ToolUseBlock(id="t2", name="mcp__notion__notion-update-page", input={})
+            ],
+            model="claude-sonnet-4-20250514",
+        )
+
+        assert (
+            ClaudeSDKManager._last_tool_name([older, newer])
+            == "mcp__notion__notion-update-page"
+        )
+
+    def test_last_tool_name_none_when_no_tool_use(self):
+        text_only = _make_assistant_message("just talking")
+        assert ClaudeSDKManager._last_tool_name([text_only]) is None
+
+    def test_last_tool_name_empty_messages(self):
+        assert ClaudeSDKManager._last_tool_name([]) is None
+
+
 class TestClaudeSandboxSettings:
     """Test sandbox and system_prompt settings on ClaudeAgentOptions."""
 
@@ -518,6 +680,174 @@ class TestClaudeSandboxSettings:
             "autoAllowBashIfSandboxed": True,
             "excludedCommands": ["git", "npm"],
         }
+
+    async def test_sandbox_auto_allow_disabled_when_bash_gated(self, tmp_path):
+        """autoAllowBashIfSandboxed is False when Bash requires interactive approval.
+
+        Otherwise the SDK would auto-approve sandboxed Bash calls without ever
+        invoking can_use_tool, silently bypassing both the approval prompt and
+        the static bash-boundary check.
+        """
+        config = Settings(
+            telegram_bot_token="test:token",
+            telegram_bot_username="testbot",
+            approved_directory=tmp_path,
+            claude_timeout_seconds=2,
+            sandbox_enabled=True,
+            interactive_tool_approval=True,
+            interactive_tool_approval_tools=["Bash", "Write", "Edit"],
+        )
+        manager = ClaudeSDKManager(config)
+
+        captured_options = []
+        mock_factory = _mock_client_factory(
+            _make_assistant_message("Test response"),
+            _make_result_message(total_cost_usd=0.01),
+            capture_options=captured_options,
+        )
+
+        with patch(
+            "src.claude.sdk_integration.ClaudeSDKClient", side_effect=mock_factory
+        ):
+            await manager.execute_command(
+                prompt="Test prompt",
+                working_directory=tmp_path,
+            )
+
+        assert captured_options[0].sandbox["autoAllowBashIfSandboxed"] is False
+
+    async def test_sandbox_auto_allow_kept_when_bash_not_gated(self, tmp_path):
+        """autoAllowBashIfSandboxed stays True when Bash isn't in the gated tool list."""
+        config = Settings(
+            telegram_bot_token="test:token",
+            telegram_bot_username="testbot",
+            approved_directory=tmp_path,
+            claude_timeout_seconds=2,
+            sandbox_enabled=True,
+            interactive_tool_approval=True,
+            interactive_tool_approval_tools=["Write", "Edit"],
+        )
+        manager = ClaudeSDKManager(config)
+
+        captured_options = []
+        mock_factory = _mock_client_factory(
+            _make_assistant_message("Test response"),
+            _make_result_message(total_cost_usd=0.01),
+            capture_options=captured_options,
+        )
+
+        with patch(
+            "src.claude.sdk_integration.ClaudeSDKClient", side_effect=mock_factory
+        ):
+            await manager.execute_command(
+                prompt="Test prompt",
+                working_directory=tmp_path,
+            )
+
+        assert captured_options[0].sandbox["autoAllowBashIfSandboxed"] is True
+
+    async def test_gated_tools_removed_from_allowed_tools(self, tmp_path):
+        """Tools gated behind interactive approval are excluded from allowed_tools.
+
+        allowed_tools pre-approves a tool at the CLI level, so can_use_tool is
+        never consulted for it -- a gated tool must be excluded or its
+        approval prompt (and the static per-tool checks) would never fire.
+        """
+        config = Settings(
+            telegram_bot_token="test:token",
+            telegram_bot_username="testbot",
+            approved_directory=tmp_path,
+            claude_timeout_seconds=2,
+            interactive_tool_approval=True,
+            interactive_tool_approval_tools=["Bash", "Write"],
+        )
+        manager = ClaudeSDKManager(config)
+
+        captured_options = []
+        mock_factory = _mock_client_factory(
+            _make_assistant_message("Test response"),
+            _make_result_message(total_cost_usd=0.01),
+            capture_options=captured_options,
+        )
+
+        with patch(
+            "src.claude.sdk_integration.ClaudeSDKClient", side_effect=mock_factory
+        ):
+            await manager.execute_command(
+                prompt="Test prompt",
+                working_directory=tmp_path,
+            )
+
+        allowed = captured_options[0].allowed_tools
+        assert "Bash" not in allowed
+        assert "Write" not in allowed
+        assert "Read" in allowed  # untouched, still allowed as before
+
+    async def test_allowed_tools_untouched_when_interactive_approval_disabled(
+        self, tmp_path
+    ):
+        """allowed_tools is unaffected when interactive approval is off.
+
+        Regression guard: interactive_tool_approval_tools defaults to
+        ["Bash", "Write", "Edit"] even when the feature itself is disabled,
+        so the exclusion must key off interactive_tool_approval, not just
+        whether the tools list is non-empty.
+        """
+        config = Settings(
+            telegram_bot_token="test:token",
+            telegram_bot_username="testbot",
+            approved_directory=tmp_path,
+            claude_timeout_seconds=2,
+            interactive_tool_approval=False,
+        )
+        manager = ClaudeSDKManager(config)
+
+        captured_options = []
+        mock_factory = _mock_client_factory(
+            _make_assistant_message("Test response"),
+            _make_result_message(total_cost_usd=0.01),
+            capture_options=captured_options,
+        )
+
+        with patch(
+            "src.claude.sdk_integration.ClaudeSDKClient", side_effect=mock_factory
+        ):
+            await manager.execute_command(
+                prompt="Test prompt",
+                working_directory=tmp_path,
+            )
+
+        assert captured_options[0].allowed_tools == config.claude_allowed_tools
+
+    async def test_empty_allowed_tools_unaffected_by_approval_filter(self, tmp_path):
+        """When DISABLE_TOOL_VALIDATION empties allowed_tools, filtering is a no-op."""
+        config = Settings(
+            telegram_bot_token="test:token",
+            telegram_bot_username="testbot",
+            approved_directory=tmp_path,
+            claude_timeout_seconds=2,
+            disable_tool_validation=True,
+            interactive_tool_approval=True,
+            interactive_tool_approval_tools=["Bash"],
+        )
+        manager = ClaudeSDKManager(config)
+
+        captured_options = []
+        mock_factory = _mock_client_factory(
+            _make_assistant_message("Test response"),
+            _make_result_message(total_cost_usd=0.01),
+            capture_options=captured_options,
+        )
+
+        with patch(
+            "src.claude.sdk_integration.ClaudeSDKClient", side_effect=mock_factory
+        ):
+            await manager.execute_command(
+                prompt="Test prompt",
+                working_directory=tmp_path,
+            )
+
+        assert captured_options[0].allowed_tools == []
 
     async def test_system_prompt_set_with_working_directory(
         self, sdk_manager, tmp_path
@@ -601,8 +931,13 @@ class TestClaudeSandboxSettings:
         assert len(captured_options) == 1
         assert captured_options[0].allowed_tools == ["Read", "Write", "Bash"]
 
-    async def test_disable_tool_validation_sets_allowed_tools_none(self, tmp_path):
-        """allowed_tools=None when DISABLE_TOOL_VALIDATION=true."""
+    async def test_disable_tool_validation_sets_allowed_tools_empty(self, tmp_path):
+        """allowed_tools=[] when DISABLE_TOOL_VALIDATION=true.
+
+        Empty rather than None: ClaudeAgentOptions declares these as
+        list[str], and both values are falsy so the CLI omits the flags
+        either way -- no tool restriction, which is the intent. See #206.
+        """
         config = Settings(
             telegram_bot_token="test:token",
             telegram_bot_username="testbot",
@@ -630,8 +965,8 @@ class TestClaudeSandboxSettings:
             )
 
         assert len(captured_options) == 1
-        assert captured_options[0].allowed_tools is None
-        assert captured_options[0].disallowed_tools is None
+        assert captured_options[0].allowed_tools == []
+        assert captured_options[0].disallowed_tools == []
 
     async def test_tool_validation_enabled_passes_configured_tools(self, tmp_path):
         """allowed/disallowed_tools passed when DISABLE_TOOL_VALIDATION=false."""
@@ -664,6 +999,43 @@ class TestClaudeSandboxSettings:
         assert len(captured_options) == 1
         assert captured_options[0].allowed_tools == ["Read", "Write"]
         assert captured_options[0].disallowed_tools == ["WebFetch"]
+
+    async def test_none_tool_lists_coerced_to_empty_lists(self, tmp_path):
+        """None tool settings reach the SDK as [], never as None.
+
+        Both settings are Optional, but ClaudeAgentOptions declares them as
+        list[str]. claude-agent-sdk 0.2 stopped tolerating None: the transport
+        calls list(options.allowed_tools) and the connect-time shadowing check
+        iterates it, so None raises TypeError before the CLI starts.
+        """
+        config = Settings(
+            telegram_bot_token="test:token",
+            telegram_bot_username="testbot",
+            approved_directory=tmp_path,
+            claude_timeout_seconds=2,
+            claude_allowed_tools=None,
+            claude_disallowed_tools=None,
+        )
+        manager = ClaudeSDKManager(config)
+
+        captured_options: list = []
+        mock_factory = _mock_client_factory(
+            _make_assistant_message("Test response"),
+            _make_result_message(total_cost_usd=0.01),
+            capture_options=captured_options,
+        )
+
+        with patch(
+            "src.claude.sdk_integration.ClaudeSDKClient", side_effect=mock_factory
+        ):
+            await manager.execute_command(
+                prompt="Test prompt",
+                working_directory=tmp_path,
+            )
+
+        assert len(captured_options) == 1
+        assert captured_options[0].allowed_tools == []
+        assert captured_options[0].disallowed_tools == []
 
     async def test_empty_cli_path_coerced_to_none(self, tmp_path):
         """Empty CLAUDE_CLI_PATH ('') is coerced to None so SDK auto-discovers the CLI."""
@@ -908,6 +1280,34 @@ class TestCanUseToolCallback:
         assert isinstance(result, PermissionResultDeny)
         assert "boundary violation" in result.message.lower()
 
+    async def test_denies_invalid_multiedit_path(
+        self, callback, context, security_validator
+    ):
+        """MultiEdit mutates files and is validated like Write/Edit."""
+        security_validator.validate_path.return_value = (
+            False,
+            None,
+            "Outside approved",
+        )
+        result = await callback("MultiEdit", {"file_path": "/etc/hosts"}, context)
+        assert isinstance(result, PermissionResultDeny)
+
+    async def test_denies_invalid_notebook_path(
+        self, callback, context, security_validator
+    ):
+        """NotebookEdit passes its target as notebook_path, not file_path."""
+        security_validator.validate_path.return_value = (
+            False,
+            None,
+            "Outside approved",
+        )
+        result = await callback(
+            "NotebookEdit", {"notebook_path": "/etc/evil.ipynb"}, context
+        )
+        assert isinstance(result, PermissionResultDeny)
+        security_validator.validate_path.assert_called_once()
+        assert security_validator.validate_path.call_args[0][0] == "/etc/evil.ipynb"
+
     async def test_allows_unknown_tool(self, callback, context):
         """Tools not in file/bash sets are allowed through."""
         result = await callback("Grep", {"pattern": "foo"}, context)
@@ -922,6 +1322,83 @@ class TestCanUseToolCallback:
         """File tool call without a path key is allowed (no path to validate)."""
         result = await callback("Read", {"content": "something"}, context)
         assert isinstance(result, PermissionResultAllow)
+
+    async def test_approval_callback_not_invoked_when_not_configured(
+        self, callback, context
+    ):
+        """Without an approval_callback, gated tools still pass through."""
+        result = await callback("Bash", {"command": "echo hi"}, context)
+        assert isinstance(result, PermissionResultAllow)
+
+    async def test_approval_callback_grants(
+        self, security_validator, working_dir, approved_dir, context
+    ):
+        """A tool in approval_tool_names is allowed when approval_callback returns True."""
+        approval_callback = AsyncMock(return_value=True)
+        callback = _make_can_use_tool_callback(
+            security_validator=security_validator,
+            working_directory=working_dir,
+            approved_directory=approved_dir,
+            approval_callback=approval_callback,
+            approval_tool_names=frozenset({"Bash"}),
+        )
+        result = await callback(
+            "Bash", {"command": f"mkdir -p {approved_dir}/subdir"}, context
+        )
+        assert isinstance(result, PermissionResultAllow)
+        approval_callback.assert_awaited_once_with(
+            "Bash", {"command": f"mkdir -p {approved_dir}/subdir"}
+        )
+
+    async def test_approval_callback_denies(
+        self, security_validator, working_dir, approved_dir, context
+    ):
+        """A tool in approval_tool_names is denied when approval_callback returns False."""
+        approval_callback = AsyncMock(return_value=False)
+        callback = _make_can_use_tool_callback(
+            security_validator=security_validator,
+            working_directory=working_dir,
+            approved_directory=approved_dir,
+            approval_callback=approval_callback,
+            approval_tool_names=frozenset({"Bash"}),
+        )
+        result = await callback(
+            "Bash", {"command": f"mkdir -p {approved_dir}/subdir"}, context
+        )
+        assert isinstance(result, PermissionResultDeny)
+        assert "Denied by user" in result.message
+
+    async def test_approval_callback_skipped_for_unlisted_tool(
+        self, security_validator, working_dir, approved_dir, context
+    ):
+        """Tools outside approval_tool_names bypass the approval callback entirely."""
+        approval_callback = AsyncMock(return_value=False)
+        callback = _make_can_use_tool_callback(
+            security_validator=security_validator,
+            working_directory=working_dir,
+            approved_directory=approved_dir,
+            approval_callback=approval_callback,
+            approval_tool_names=frozenset({"Bash"}),
+        )
+        result = await callback("Read", {"file_path": "src/main.py"}, context)
+        assert isinstance(result, PermissionResultAllow)
+        approval_callback.assert_not_awaited()
+
+    async def test_approval_callback_not_called_when_static_check_denies(
+        self, security_validator, working_dir, approved_dir, context
+    ):
+        """A path/bash boundary denial short-circuits before approval is requested."""
+        approval_callback = AsyncMock(return_value=True)
+        callback = _make_can_use_tool_callback(
+            security_validator=security_validator,
+            working_directory=working_dir,
+            approved_directory=approved_dir,
+            approval_callback=approval_callback,
+            approval_tool_names=frozenset({"Bash"}),
+        )
+        result = await callback("Bash", {"command": "mkdir -p /tmp/evil"}, context)
+        assert isinstance(result, PermissionResultDeny)
+        approval_callback.assert_not_awaited()
 
     async def test_wired_into_sdk_manager(self, tmp_path):
         """SecurityValidator is wired into options.can_use_tool by execute_command."""
@@ -951,6 +1428,83 @@ class TestCanUseToolCallback:
         assert len(captured_options) == 1
         assert captured_options[0].can_use_tool is not None
 
+    async def test_wired_with_interactive_approval(self, tmp_path):
+        """execute_command wires approval_callback into can_use_tool when enabled."""
+        validator = MagicMock()
+        validator.validate_path = MagicMock(return_value=(True, tmp_path, None))
+
+        config = Settings(
+            telegram_bot_token="test:token",
+            telegram_bot_username="testbot",
+            approved_directory=tmp_path,
+            claude_timeout_seconds=2,
+            interactive_tool_approval=True,
+            interactive_tool_approval_tools=["Bash"],
+        )
+        manager = ClaudeSDKManager(config, security_validator=validator)
+        approval_callback = AsyncMock(return_value=False)
+
+        captured_options = []
+        mock_factory = _mock_client_factory(
+            _make_assistant_message("ok"),
+            _make_result_message(total_cost_usd=0.01),
+            capture_options=captured_options,
+        )
+
+        with patch(
+            "src.claude.sdk_integration.ClaudeSDKClient", side_effect=mock_factory
+        ):
+            await manager.execute_command(
+                prompt="Test",
+                working_directory=tmp_path,
+                approval_callback=approval_callback,
+            )
+
+        can_use_tool = captured_options[0].can_use_tool
+        result = await can_use_tool(
+            "Bash", {"command": "echo hi"}, ToolPermissionContext()
+        )
+        assert isinstance(result, PermissionResultDeny)
+        approval_callback.assert_awaited_once_with("Bash", {"command": "echo hi"})
+
+    async def test_approval_callback_not_wired_when_disabled(self, tmp_path):
+        """approval_callback is ignored when interactive_tool_approval is False."""
+        validator = MagicMock()
+        validator.validate_path = MagicMock(return_value=(True, tmp_path, None))
+
+        config = Settings(
+            telegram_bot_token="test:token",
+            telegram_bot_username="testbot",
+            approved_directory=tmp_path,
+            claude_timeout_seconds=2,
+            interactive_tool_approval=False,
+        )
+        manager = ClaudeSDKManager(config, security_validator=validator)
+        approval_callback = AsyncMock(return_value=False)
+
+        captured_options = []
+        mock_factory = _mock_client_factory(
+            _make_assistant_message("ok"),
+            _make_result_message(total_cost_usd=0.01),
+            capture_options=captured_options,
+        )
+
+        with patch(
+            "src.claude.sdk_integration.ClaudeSDKClient", side_effect=mock_factory
+        ):
+            await manager.execute_command(
+                prompt="Test",
+                working_directory=tmp_path,
+                approval_callback=approval_callback,
+            )
+
+        can_use_tool = captured_options[0].can_use_tool
+        result = await can_use_tool(
+            "Bash", {"command": "echo hi"}, ToolPermissionContext()
+        )
+        assert isinstance(result, PermissionResultAllow)
+        approval_callback.assert_not_awaited()
+
     async def test_no_callback_without_security_validator(self, tmp_path):
         """Verify can_use_tool is None when no SecurityValidator is provided."""
         config = Settings(
@@ -975,6 +1529,127 @@ class TestCanUseToolCallback:
 
         assert len(captured_options) == 1
         assert captured_options[0].can_use_tool is None
+
+
+class TestGuardedToolsNotPreApproved:
+    """Regression tests for #219.
+
+    ``can_use_tool`` is purely reactive: the SDK invokes it only when the CLI
+    sends a ``can_use_tool`` control request, and the CLI resolves allow rules
+    before consulting the permission prompt tool. A guarded tool left in
+    ``allowed_tools`` is therefore pre-approved and its boundary check never
+    runs. These tests pin that the guarded tools are absent from the
+    ``ClaudeAgentOptions`` actually handed to the SDK.
+    """
+
+    @staticmethod
+    def _config(tmp_path, **overrides):
+        return Settings(
+            telegram_bot_token="test:token",
+            telegram_bot_username="testbot",
+            approved_directory=tmp_path,
+            claude_timeout_seconds=2,
+            **overrides,
+        )
+
+    @staticmethod
+    def _validator(tmp_path):
+        validator = MagicMock()
+        validator.validate_path = MagicMock(return_value=(True, tmp_path, None))
+        return validator
+
+    @staticmethod
+    async def _capture(manager, tmp_path):
+        captured_options = []
+        mock_factory = _mock_client_factory(
+            _make_assistant_message("ok"),
+            _make_result_message(total_cost_usd=0.01),
+            capture_options=captured_options,
+        )
+        with patch(
+            "src.claude.sdk_integration.ClaudeSDKClient", side_effect=mock_factory
+        ):
+            await manager.execute_command(prompt="Test", working_directory=tmp_path)
+        assert len(captured_options) == 1
+        return captured_options[0]
+
+    async def test_guarded_tools_stripped_from_allowed_tools(self, tmp_path):
+        """Default config: no guarded tool is pre-approved via allowed_tools."""
+        manager = ClaudeSDKManager(
+            self._config(tmp_path), security_validator=self._validator(tmp_path)
+        )
+        options = await self._capture(manager, tmp_path)
+
+        assert options.allowed_tools is not None
+        overlap = GUARDED_TOOLS & set(options.allowed_tools)
+        assert overlap == set(), f"guarded tools pre-approved by the CLI: {overlap}"
+        # Write, Edit, Read and Bash are the tools the callback guards.
+        for tool in ("Write", "Edit", "Read", "Bash"):
+            assert tool not in options.allowed_tools
+
+    async def test_unguarded_tools_still_allowed(self, tmp_path):
+        """Tools the callback does not guard keep their allow rule."""
+        manager = ClaudeSDKManager(
+            self._config(tmp_path), security_validator=self._validator(tmp_path)
+        )
+        options = await self._capture(manager, tmp_path)
+
+        for tool in ("Glob", "Grep", "LS", "WebSearch", "TodoWrite"):
+            assert tool in options.allowed_tools
+
+    async def test_sandbox_auto_allow_bash_disabled(self, tmp_path):
+        """autoAllowBashIfSandboxed would bypass the bash boundary check."""
+        manager = ClaudeSDKManager(
+            self._config(tmp_path), security_validator=self._validator(tmp_path)
+        )
+        options = await self._capture(manager, tmp_path)
+
+        assert options.sandbox["autoAllowBashIfSandboxed"] is False
+
+    async def test_no_security_validator_leaves_allowed_tools_untouched(self, tmp_path):
+        """Without a validator there is no check to route to; nothing is gated."""
+        config = self._config(tmp_path)
+        manager = ClaudeSDKManager(config)
+        options = await self._capture(manager, tmp_path)
+
+        assert options.allowed_tools == config.claude_allowed_tools
+        assert options.sandbox["autoAllowBashIfSandboxed"] is True
+
+    async def test_disable_tool_validation_restores_permissive_behavior(self, tmp_path):
+        """DISABLE_TOOL_VALIDATION=true remains the documented escape hatch.
+
+        The escape hatch passes [] rather than None since #206 -- both are
+        falsy, so the CLI omits --allowedTools either way and nothing is
+        restricted, but [] matches the list[str] ClaudeAgentOptions declares.
+        """
+        manager = ClaudeSDKManager(
+            self._config(tmp_path, disable_tool_validation=True),
+            security_validator=self._validator(tmp_path),
+        )
+        options = await self._capture(manager, tmp_path)
+
+        assert options.allowed_tools == []
+        assert options.disallowed_tools == []
+        assert options.sandbox["autoAllowBashIfSandboxed"] is True
+
+    async def test_custom_allowed_tools_are_filtered_too(self, tmp_path):
+        """A user-supplied allowlist is filtered on the same rule."""
+        manager = ClaudeSDKManager(
+            self._config(tmp_path, claude_allowed_tools=["Read", "Bash", "Grep"]),
+            security_validator=self._validator(tmp_path),
+        )
+        options = await self._capture(manager, tmp_path)
+
+        assert options.allowed_tools == ["Grep"]
+
+    async def test_config_allowed_tools_not_mutated(self, tmp_path):
+        """Filtering builds a new list; the Settings value is left intact."""
+        config = self._config(tmp_path)
+        original = list(config.claude_allowed_tools)
+        manager = ClaudeSDKManager(config, security_validator=self._validator(tmp_path))
+        await self._capture(manager, tmp_path)
+
+        assert config.claude_allowed_tools == original
 
 
 class TestSessionIdFallback:
@@ -1184,3 +1859,376 @@ class TestClaudeMdLoading:
 
         opts = captured[0]
         assert opts.setting_sources == ["project"]
+
+
+class TestAwaitCancelledBounded:
+    """Cancelling an SDK task must never hang the caller.
+
+    Regression guard for the 2026-07-29 incident: a wedged child process
+    swallowed cancellation, the bare `await run_task` in the cleanup path
+    never returned, and the orchestrator's `finally: heartbeat.cancel()`
+    therefore never ran — leaving the Telegram typing indicator on forever
+    and the child orphaned for 15.5 hours.
+    """
+
+    @staticmethod
+    async def _wedged_task(stop: asyncio.Event) -> None:
+        """A task that swallows cancellation, like a child stuck on a pipe read."""
+        while not stop.is_set():
+            try:
+                await asyncio.sleep(0.01)
+            except asyncio.CancelledError:
+                pass  # refuse to die — this is the failure mode under test
+
+    async def test_returns_false_and_does_not_hang_when_task_ignores_cancel(self):
+        stop = asyncio.Event()
+        task = asyncio.create_task(self._wedged_task(stop))
+        await asyncio.sleep(0)  # let it start
+
+        task.cancel()
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        settled = await ClaudeSDKManager._await_cancelled(
+            task, reason="test", timeout=0.05
+        )
+        elapsed = loop.time() - started
+
+        assert settled is False, "a wedged task must be reported as unsettled"
+        # The point of the fix: control returns on a bound, not never.
+        assert elapsed < 2.0, f"cleanup await was not bounded (took {elapsed:.2f}s)"
+
+        # Let the fixture task exit so it does not leak into other tests.
+        stop.set()
+        await asyncio.wait({task}, timeout=1.0)
+
+    async def test_returns_true_when_task_honors_cancellation(self):
+        async def _cooperative() -> None:
+            await asyncio.sleep(60)
+
+        task = asyncio.create_task(_cooperative())
+        await asyncio.sleep(0)
+        task.cancel()
+
+        settled = await ClaudeSDKManager._await_cancelled(
+            task, reason="test", timeout=1.0
+        )
+
+        assert settled is True
+        assert task.cancelled()
+
+
+def _process_state(pid: int) -> str:
+    """Return the Linux process state letter, or "gone" if the pid is absent.
+
+    "Z" (zombie) counts as dead for reaping purposes — the process no longer
+    runs, it is merely waiting to be reaped by its parent.
+    """
+    try:
+        with open(f"/proc/{pid}/status", encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("State:"):
+                    return line.split()[1]
+    except OSError:
+        return "gone"
+    return "gone"
+
+
+def _is_running(pid: int) -> bool:
+    return _process_state(pid) not in ("gone", "Z", "X")
+
+
+@pytest.mark.skipif(
+    not os.path.isdir("/proc"), reason="requires Linux /proc for pid discovery"
+)
+class TestReapWedgedChild:
+    """A wedged SDK child and its MCP subprocesses must not outlive the request.
+
+    Regression guard for the 2026-08-21 recurrence: after cancellation failed
+    to settle, the `claude` child survived 2h28m holding 660MB plus its own
+    node/bun MCP subprocesses, because the transport's cooperative shutdown
+    was itself blocked.
+    """
+
+    @staticmethod
+    def _spawn_tree():
+        """Spawn `sh` owning two `sleep` children; returns the Popen."""
+        import subprocess
+
+        # Trailing `true` prevents the shell from exec'ing into the last sleep,
+        # so `sh` survives as the parent of both children.
+        return subprocess.Popen(["sh", "-c", "sleep 300 & sleep 300; true"])
+
+    @staticmethod
+    def _fake_client(pid: int, returncode=None):
+        import types
+
+        process = types.SimpleNamespace(pid=pid, returncode=returncode)
+        transport = types.SimpleNamespace(_process=process)
+        return types.SimpleNamespace(_transport=transport)
+
+    def test_kills_child_and_its_descendants(self):
+        proc = self._spawn_tree()
+        try:
+            # Give the shell a moment to fork both sleeps.
+            deadline = time.monotonic() + 5.0
+            descendants = []
+            while time.monotonic() < deadline:
+                descendants = ClaudeSDKManager._descendant_pids(proc.pid)
+                if len(descendants) >= 2:
+                    break
+                time.sleep(0.05)
+
+            assert (
+                len(descendants) >= 2
+            ), f"expected to discover 2 sleep children, found {descendants}"
+
+            ClaudeSDKManager._reap_wedged_child(
+                self._fake_client(proc.pid), reason="test"
+            )
+
+            assert proc.wait(timeout=5) != 0, "child should have been killed"
+            for pid in descendants:
+                assert not _is_running(pid), f"descendant {pid} survived the reap"
+        finally:
+            proc.kill()
+            proc.wait(timeout=5)
+
+    def test_skips_process_that_already_exited(self):
+        proc = self._spawn_tree()
+        proc.kill()
+        proc.wait(timeout=5)
+
+        # returncode set => transport already shut down cleanly; nothing to do.
+        ClaudeSDKManager._reap_wedged_child(
+            self._fake_client(proc.pid, returncode=0), reason="test"
+        )
+
+    def test_refuses_to_kill_own_process(self):
+        # The guard matters: SIGKILL on our own pid would take down the bot.
+        ClaudeSDKManager._reap_wedged_child(
+            self._fake_client(os.getpid()), reason="test"
+        )
+        assert _is_running(os.getpid())
+
+    @pytest.mark.parametrize("client", [None, object(), "not-a-client"])
+    def test_never_raises_on_unexpected_client(self, client):
+        # Runs on an already-failing path; it must not mask the original error.
+        ClaudeSDKManager._reap_wedged_child(client, reason="test")
+
+    def test_descendant_pids_of_leaf_process_is_empty(self):
+        import subprocess
+
+        proc = subprocess.Popen(["sleep", "300"])
+        try:
+            assert ClaudeSDKManager._descendant_pids(proc.pid) == []
+        finally:
+            proc.kill()
+            proc.wait(timeout=5)
+
+
+class TestStopReasonCapture:
+    """ResultMessage stop-reason fields reach ClaudeResponse (#230, #172)."""
+
+    @pytest.fixture
+    def config(self, tmp_path):
+        return Settings(
+            telegram_bot_token="test:token",
+            telegram_bot_username="testbot",
+            approved_directory=tmp_path,
+            claude_timeout_seconds=2,
+        )
+
+    @pytest.fixture
+    def sdk_manager(self, config):
+        return ClaudeSDKManager(config)
+
+    @staticmethod
+    def _tool_use_message(name="Bash"):
+        """An assistant turn that used a tool but produced no text."""
+        return AssistantMessage(
+            content=[ToolUseBlock(id="tool-1", name=name, input={"command": "ls"})],
+            model="claude-sonnet-4-20250514",
+        )
+
+    async def test_success_subtype_still_reports_completion(self, sdk_manager):
+        mock_factory = _mock_client_factory(
+            self._tool_use_message(),
+            _make_result_message(subtype="success", result=None),
+        )
+
+        with patch(
+            "src.claude.sdk_integration.ClaudeSDKClient", side_effect=mock_factory
+        ):
+            response = await sdk_manager.execute_command(
+                prompt="Test prompt",
+                working_directory=Path("/test"),
+            )
+
+        assert response.content == TASK_COMPLETED_MSG.format(tools_summary="Bash")
+        assert response.result_subtype == "success"
+        assert response.completed_normally is True
+
+    async def test_max_turns_does_not_claim_completion(self, sdk_manager):
+        """A run killed at the turn limit used to report success (#172)."""
+        mock_factory = _mock_client_factory(
+            self._tool_use_message(),
+            _make_result_message(
+                subtype="error_max_turns",
+                is_error=True,
+                result=None,
+                terminal_reason="max_turns",
+                errors=["Reached maximum number of turns"],
+            ),
+        )
+
+        with patch(
+            "src.claude.sdk_integration.ClaudeSDKClient", side_effect=mock_factory
+        ):
+            response = await sdk_manager.execute_command(
+                prompt="Test prompt",
+                working_directory=Path("/test"),
+            )
+
+        assert TASK_COMPLETED_MSG.format(tools_summary="Bash") not in response.content
+        assert response.content == TASK_STOPPED_MSG.format(tools_summary="Bash")
+        assert response.result_subtype == "error_max_turns"
+        assert response.terminal_reason == "max_turns"
+        assert response.errors == ["Reached maximum number of turns"]
+        assert response.completed_normally is False
+
+    async def test_permission_denials_reach_response(self, sdk_manager):
+        mock_factory = _mock_client_factory(
+            _make_assistant_message("Done what I could"),
+            _make_result_message(
+                result="Done what I could",
+                permission_denials=[
+                    {
+                        "tool_name": "Write",
+                        "tool_use_id": "t1",
+                        "tool_input": {"file_path": "/etc/hosts"},
+                    },
+                    {"toolName": "Bash", "toolInput": {"command": "cd /"}},
+                ],
+            ),
+        )
+
+        with patch(
+            "src.claude.sdk_integration.ClaudeSDKClient", side_effect=mock_factory
+        ):
+            response = await sdk_manager.execute_command(
+                prompt="Test prompt",
+                working_directory=Path("/test"),
+            )
+
+        assert response.permission_denials == [
+            {"tool_name": "Write", "tool_input": {"file_path": "/etc/hosts"}},
+            {"tool_name": "Bash", "tool_input": {"command": "cd /"}},
+        ]
+        # A denial on its own does not make the run a failure.
+        assert response.completed_normally is True
+
+    async def test_missing_fields_are_tolerated(self, sdk_manager):
+        """Older CLI versions omit the 0.2 fields entirely."""
+        mock_factory = _mock_client_factory(
+            _make_assistant_message("Test response"),
+            _make_result_message(),
+        )
+
+        with patch(
+            "src.claude.sdk_integration.ClaudeSDKClient", side_effect=mock_factory
+        ):
+            response = await sdk_manager.execute_command(
+                prompt="Test prompt",
+                working_directory=Path("/test"),
+            )
+
+        assert response.stop_reason is None
+        assert response.terminal_reason is None
+        assert response.errors == []
+        assert response.permission_denials == []
+
+    def test_response_defaults_keep_existing_callers_working(self):
+        response = ClaudeResponse(
+            content="hi", session_id="s", cost=0.0, duration_ms=1, num_turns=1
+        )
+        assert response.result_subtype is None
+        assert response.errors == []
+        assert response.permission_denials == []
+        assert response.completed_normally is True
+
+
+class TestNumTurns:
+    """num_turns comes from the CLI, not from counting messages."""
+
+    @pytest.fixture
+    def config(self, tmp_path):
+        return Settings(
+            telegram_bot_token="test:token",
+            telegram_bot_username="testbot",
+            approved_directory=tmp_path,
+            claude_timeout_seconds=2,
+        )
+
+    @pytest.fixture
+    def sdk_manager(self, config):
+        return ClaudeSDKManager(config)
+
+    async def test_result_message_wins_over_the_message_count(self, sdk_manager):
+        """Every tool result arrives as another UserMessage, so counting
+        messages over-reports the turns -- and the stop-reason footer shows
+        that number to the user."""
+        mock_factory = _mock_client_factory(
+            _make_assistant_message("one"),
+            _make_assistant_message("two"),
+            _make_assistant_message("three"),
+            _make_result_message(num_turns=10, subtype="error_max_turns"),
+        )
+
+        with patch(
+            "src.claude.sdk_integration.ClaudeSDKClient", side_effect=mock_factory
+        ):
+            response = await sdk_manager.execute_command(
+                prompt="Test prompt",
+                working_directory=Path("/test"),
+            )
+
+        assert response.num_turns == 10
+
+    async def test_zero_turns_is_taken_at_face_value(self, sdk_manager):
+        mock_factory = _mock_client_factory(
+            _make_assistant_message("one"),
+            _make_result_message(num_turns=0),
+        )
+
+        with patch(
+            "src.claude.sdk_integration.ClaudeSDKClient", side_effect=mock_factory
+        ):
+            response = await sdk_manager.execute_command(
+                prompt="Test prompt",
+                working_directory=Path("/test"),
+            )
+
+        assert response.num_turns == 0
+
+    async def test_falls_back_to_counting_when_the_cli_reports_nothing(
+        self, sdk_manager
+    ):
+        """An older CLI, or a result that never reached the query loop."""
+        result = _make_result_message()
+        del result.num_turns
+
+        mock_factory = _mock_client_factory(
+            _make_assistant_message("one"),
+            _make_assistant_message("two"),
+            result,
+        )
+
+        with patch(
+            "src.claude.sdk_integration.ClaudeSDKClient", side_effect=mock_factory
+        ):
+            response = await sdk_manager.execute_command(
+                prompt="Test prompt",
+                working_directory=Path("/test"),
+            )
+
+        assert response.num_turns == 2

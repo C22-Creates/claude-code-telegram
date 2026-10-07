@@ -8,9 +8,10 @@ classic mode, delegates to existing full-featured handlers.
 import asyncio
 import re
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 import structlog
 from telegram import (
@@ -39,6 +40,7 @@ from .utils.image_extractor import (
     should_send_as_photo,
     validate_image_path,
 )
+from .utils.session_scope import scope_key_from_context
 
 logger = structlog.get_logger()
 
@@ -127,6 +129,14 @@ class ActiveRequest:
     progress_msg: Any = None  # telegram Message object
 
 
+@dataclass
+class PendingToolApproval:
+    """Tracks an in-flight interactive tool-approval prompt."""
+
+    user_id: int
+    future: "asyncio.Future[bool]"
+
+
 class MessageOrchestrator:
     """Routes messages based on mode. Single entry point for all Telegram updates."""
 
@@ -135,9 +145,8 @@ class MessageOrchestrator:
         self.deps = deps
         # Keyed by (user_id, chat_id, thread_id_or_0) so concurrent requests
         # in different topics don't clobber each other's Stop handles.
-        self._active_requests: Dict[
-            Tuple[int, int, int], ActiveRequest
-        ] = {}
+        self._active_requests: Dict[Tuple[int, int, int], ActiveRequest] = {}
+        self._pending_tool_approvals: Dict[str, PendingToolApproval] = {}
         self._known_commands: frozenset[str] = frozenset()
 
     @staticmethod
@@ -260,6 +269,7 @@ class MessageOrchestrator:
             "project_slug": project.slug,
             "project_root": str(project_root),
             "project_name": project.name,
+            "project_agent": getattr(project, "agent", "") or "",
         }
         return True
 
@@ -404,6 +414,14 @@ class MessageOrchestrator:
             CallbackQueryHandler(
                 self._inject_deps(self._handle_stop_callback),
                 pattern=r"^stop:",
+            )
+        )
+
+        # Interactive tool-approval callback (Allow/Deny buttons)
+        app.add_handler(
+            CallbackQueryHandler(
+                self._inject_deps(self._handle_tool_approval_callback),
+                pattern=r"^tapv:",
             )
         )
 
@@ -708,6 +726,47 @@ class MessageOrchestrator:
         return ""
 
     @staticmethod
+    def _summarize_tool_input_for_approval(
+        tool_name: str, tool_input: Dict[str, Any]
+    ) -> str:
+        """Return a detailed summary of tool input for an approval prompt.
+
+        Unlike ``_summarize_tool_input`` (built for compact verbose-log
+        lines), this needs to give a human enough detail to make an
+        allow/deny security decision: the full file path rather than just
+        the filename, and a long window for Bash commands rather than an
+        80-character preview that hides everything after it.
+        """
+        if not tool_input:
+            return ""
+        if tool_name in ("Read", "Write", "Edit", "MultiEdit"):
+            path = tool_input.get("file_path") or tool_input.get("path", "")
+            if path:
+                return path
+        if tool_name in ("Glob", "Grep"):
+            pattern = tool_input.get("pattern", "")
+            if pattern:
+                return pattern[:200]
+        if tool_name == "Bash":
+            cmd = tool_input.get("command", "")
+            if cmd:
+                redacted = _redact_secrets(cmd)
+                if len(redacted) > 1000:
+                    return redacted[:1000] + "…"
+                return redacted
+        if tool_name in ("WebFetch", "WebSearch"):
+            return (tool_input.get("url", "") or tool_input.get("query", ""))[:200]
+        if tool_name == "Task":
+            desc = tool_input.get("description", "")
+            if desc:
+                return desc[:200]
+        # Generic: show first key's value
+        for v in tool_input.values():
+            if isinstance(v, str) and v:
+                return v[:200]
+        return ""
+
+    @staticmethod
     def _start_typing_heartbeat(
         chat: Any,
         interval: float = 2.0,
@@ -961,10 +1020,14 @@ class MessageOrchestrator:
         interrupt_event = asyncio.Event()
         active_key = self._active_key_from_update(update, user_id)
         stop_kb = InlineKeyboardMarkup(
-            [[InlineKeyboardButton(
-                "Stop",
-                callback_data=f"stop:{active_key[0]}:{active_key[1]}:{active_key[2]}",
-            )]]
+            [
+                [
+                    InlineKeyboardButton(
+                        "Stop",
+                        callback_data=f"stop:{active_key[0]}:{active_key[1]}:{active_key[2]}",
+                    )
+                ]
+            ]
         )
         progress_msg = await update.message.reply_text(
             "Working...", reply_markup=stop_kb
@@ -1027,16 +1090,27 @@ class MessageOrchestrator:
         # Independent typing heartbeat — stays alive even with no stream events
         heartbeat = self._start_typing_heartbeat(chat)
 
+        approval_cb = None
+        if self.settings.interactive_tool_approval:
+            approval_cb = self._make_tool_approval_callback(
+                user_id=user_id,
+                chat_id=chat.id,
+                bot=context.bot,
+                message_thread_id=update.message.message_thread_id,
+            )
+
         success = True
         try:
             claude_response = await claude_integration.run_command(
                 prompt=message_text,
                 working_directory=current_dir,
                 user_id=user_id,
+                scope_key=scope_key_from_context(context),
                 session_id=session_id,
                 on_stream=on_stream,
                 force_new=force_new,
                 interrupt_event=interrupt_event,
+                approval_callback=approval_cb,
             )
 
             # New session created successfully — clear the one-shot flag
@@ -1067,17 +1141,15 @@ class MessageOrchestrator:
                     logger.warning("Failed to log interaction", error=str(e))
 
             # Format response (no reply_markup — strip keyboards)
-            from .utils.formatting import ResponseFormatter
+            from .utils.formatting import ResponseFormatter, with_stop_reason
 
             formatter = ResponseFormatter(self.settings)
 
-            response_content = claude_response.content
-            if claude_response.interrupted:
-                response_content = (
-                    response_content or ""
-                ) + "\n\n_(Interrupted by user)_"
-
-            formatted_messages = formatter.format_claude_response(response_content)
+            # with_stop_reason carries the interruption note, the reason the
+            # run stopped, and any blocked tool calls (#230, #172).
+            formatted_messages = formatter.format_claude_response(
+                with_stop_reason(claude_response)
+            )
 
         except Exception as e:
             success = False
@@ -1284,6 +1356,7 @@ class MessageOrchestrator:
                 prompt=prompt,
                 working_directory=current_dir,
                 user_id=user_id,
+                scope_key=scope_key_from_context(context),
                 session_id=session_id,
                 on_stream=on_stream,
                 force_new=force_new,
@@ -1300,11 +1373,11 @@ class MessageOrchestrator:
                 claude_response, context, self.settings, user_id
             )
 
-            from .utils.formatting import ResponseFormatter
+            from .utils.formatting import ResponseFormatter, with_stop_reason
 
             formatter = ResponseFormatter(self.settings)
             formatted_messages = formatter.format_claude_response(
-                claude_response.content
+                with_stop_reason(claude_response)
             )
 
             try:
@@ -1493,6 +1566,7 @@ class MessageOrchestrator:
                 prompt=prompt,
                 working_directory=current_dir,
                 user_id=user_id,
+                scope_key=scope_key_from_context(context),
                 session_id=session_id,
                 on_stream=on_stream,
                 force_new=force_new,
@@ -1512,10 +1586,12 @@ class MessageOrchestrator:
             claude_response, context, self.settings, user_id
         )
 
-        from .utils.formatting import ResponseFormatter
+        from .utils.formatting import ResponseFormatter, with_stop_reason
 
         formatter = ResponseFormatter(self.settings)
-        formatted_messages = formatter.format_claude_response(claude_response.content)
+        formatted_messages = formatter.format_claude_response(
+            with_stop_reason(claude_response)
+        )
 
         try:
             await progress_msg.delete()
@@ -1627,7 +1703,9 @@ class MessageOrchestrator:
             session_id = None
             if claude_integration:
                 existing = await claude_integration._find_resumable_session(
-                    update.effective_user.id, target_path
+                    update.effective_user.id,
+                    target_path,
+                    scope_key_from_context(context),
                 )
                 if existing:
                     session_id = existing.session_id
@@ -1747,6 +1825,120 @@ class MessageOrchestrator:
         except Exception:
             pass
 
+    def _make_tool_approval_callback(
+        self,
+        user_id: int,
+        chat_id: int,
+        bot: Any,
+        message_thread_id: Optional[int],
+    ) -> Callable[[str, Dict[str, Any]], Awaitable[bool]]:
+        """Build an approval_callback closure for a single Claude run.
+
+        Sends a Telegram Allow/Deny prompt for a tool call and blocks (with a
+        timeout) until the user responds via the ``tapv:`` callback handler.
+        Fails closed (denies) on timeout.
+        """
+
+        async def request_approval(tool_name: str, tool_input: Dict[str, Any]) -> bool:
+            request_id = uuid.uuid4().hex[:12]
+            summary = self._summarize_tool_input_for_approval(tool_name, tool_input)
+            text = f"⚠️ Claude wants to run <b>{escape_html(tool_name)}</b>"
+            if summary:
+                text += f"\n<code>{escape_html(summary)}</code>"
+            text += "\n\nAllow this action?"
+
+            keyboard = InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "✅ Allow", callback_data=f"tapv:allow:{request_id}"
+                        ),
+                        InlineKeyboardButton(
+                            "❌ Deny", callback_data=f"tapv:deny:{request_id}"
+                        ),
+                    ]
+                ]
+            )
+
+            # Register the pending approval *before* sending the prompt, so a
+            # click that races the send (fast tapper, slow network) always
+            # finds an entry instead of hitting "Already handled." and
+            # stalling the future until timeout.
+            future: "asyncio.Future[bool]" = asyncio.get_running_loop().create_future()
+            self._pending_tool_approvals[request_id] = PendingToolApproval(
+                user_id=user_id, future=future
+            )
+
+            try:
+                msg = await bot.send_message(
+                    chat_id=chat_id,
+                    text=text,
+                    parse_mode="HTML",
+                    reply_markup=keyboard,
+                    message_thread_id=message_thread_id,
+                )
+            except Exception:
+                self._pending_tool_approvals.pop(request_id, None)
+                raise
+
+            try:
+                return await asyncio.wait_for(
+                    future,
+                    timeout=self.settings.interactive_tool_approval_timeout_seconds,
+                )
+            except asyncio.TimeoutError:
+                timeout_allow = (
+                    self.settings.interactive_tool_approval_timeout_action == "allow"
+                )
+                try:
+                    suffix = (
+                        "\n\n⏱ Timed out — auto-allowed"
+                        if timeout_allow
+                        else "\n\n⏱ Timed out — denied"
+                    )
+                    await msg.edit_text(
+                        text + suffix,
+                        parse_mode="HTML",
+                        reply_markup=None,
+                    )
+                except Exception:
+                    pass
+                return timeout_allow
+            finally:
+                self._pending_tool_approvals.pop(request_id, None)
+
+        return request_approval
+
+    async def _handle_tool_approval_callback(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Handle tapv: callbacks — resolve a pending tool-approval prompt."""
+        query = update.callback_query
+        _, action, request_id = query.data.split(":", 2)
+
+        pending = self._pending_tool_approvals.get(request_id)
+        if pending is None:
+            await query.answer("Already handled.", show_alert=False)
+            return
+
+        if query.from_user.id != pending.user_id:
+            await query.answer("Only the requesting user can respond.", show_alert=True)
+            return
+
+        if pending.future.done():
+            await query.answer("Already handled.", show_alert=False)
+            return
+
+        approved = action == "allow"
+        pending.future.set_result(approved)
+        await query.answer("Allowed" if approved else "Denied", show_alert=False)
+
+        try:
+            status = "✅ Allowed" if approved else "❌ Denied"
+            await query.edit_message_text(status, reply_markup=None)
+        except Exception:
+            pass
+
     async def _agentic_callback(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
@@ -1774,7 +1966,7 @@ class MessageOrchestrator:
         session_id = None
         if claude_integration:
             existing = await claude_integration._find_resumable_session(
-                query.from_user.id, new_path
+                query.from_user.id, new_path, scope_key_from_context(context)
             )
             if existing:
                 session_id = existing.session_id

@@ -10,6 +10,7 @@ Features:
 
 import shutil
 import tarfile
+import time
 import uuid
 import zipfile
 from collections import defaultdict
@@ -17,10 +18,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List
 
+import structlog
 from telegram import Document
 
 from src.config import Settings
 from src.security.validators import SecurityValidator
+
+logger = structlog.get_logger()
 
 
 @dataclass
@@ -138,37 +142,75 @@ class FileHandler:
         # Download file
         file_path = await self._download_file(document)
 
-        try:
-            # Detect file type
-            file_type = self._detect_file_type(file_path)
+        # Detect file type
+        file_type = self._detect_file_type(file_path)
 
-            # Process based on type
-            if file_type == "archive":
+        # Archives are expanded into the prompt; the container itself is disposable.
+        if file_type == "archive":
+            try:
                 return await self._process_archive(file_path, context)
-            elif file_type == "code":
-                return await self._process_code_file(file_path, context)
-            elif file_type == "text":
-                return await self._process_text_file(file_path, context)
-            else:
-                raise ValueError(f"Unsupported file type: {file_type}")
+            finally:
+                file_path.unlink(missing_ok=True)
 
-        finally:
-            # Cleanup
+        if file_type == "code":
+            processed = await self._process_code_file(file_path, context)
+        elif file_type == "text":
+            processed = await self._process_text_file(file_path, context)
+        else:
             file_path.unlink(missing_ok=True)
+            raise ValueError(f"Unsupported file type: {file_type}")
+
+        # Keep single files on disk and tell Claude where they are. Inlining the
+        # content into the prompt is lossy for anything that needs deterministic
+        # parsing (e.g. a Kindle export parsed by scripts/parse_kindle_export.py) —
+        # the model would have to retype the source byte-for-byte. Handing over a
+        # path lets downstream skills read the real bytes. Stale files are reaped
+        # by _cleanup_stale_uploads on the next upload.
+        processed.prompt = (
+            f"[Uploaded file saved at: {file_path}]\n"
+            f"Read it from that path if you need the exact contents.\n\n"
+            f"{processed.prompt}"
+        )
+        processed.metadata["saved_path"] = str(file_path)
+        return processed
 
     async def _download_file(self, document: Document) -> Path:
         """Download file from Telegram"""
         # Get file
         file = await document.get_file()
 
-        # Create temp file path
+        self._cleanup_stale_uploads()
+
+        # Each upload gets its own directory so the real filename is preserved
+        # without two uploads of the same name clobbering each other.
         file_name = document.file_name or f"file_{uuid.uuid4()}"
-        file_path = self.temp_dir / file_name
+        upload_dir = self.temp_dir / uuid.uuid4().hex[:12]
+        upload_dir.mkdir(parents=True, exist_ok=True)
+        file_path = upload_dir / file_name
 
         # Download to path
         await file.download_to_drive(str(file_path))
 
         return file_path
+
+    def _cleanup_stale_uploads(self, max_age_hours: int = 24) -> None:
+        """Delete upload directories older than max_age_hours.
+
+        Preserved uploads would otherwise accumulate in /tmp indefinitely. Best
+        effort only — a failure here must never block an upload.
+        """
+        cutoff = time.time() - (max_age_hours * 3600)
+        try:
+            for child in self.temp_dir.iterdir():
+                if not child.is_dir():
+                    continue
+                try:
+                    if child.stat().st_mtime < cutoff:
+                        shutil.rmtree(child, ignore_errors=True)
+                except OSError:
+                    continue
+        except OSError as e:
+            logger.warning("Upload cleanup failed", error=str(e))
 
     def _detect_file_type(self, file_path: Path) -> str:
         """Detect file type based on extension and content"""

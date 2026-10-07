@@ -24,6 +24,7 @@ from src.dispatcher.service import (
     PENDING,
     DispatcherService,
     RunOutcome,
+    result_is_failure,
 )
 
 
@@ -213,6 +214,31 @@ class DispatcherTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(bus.published), 1)
         self.assertIn("failed", bus.published[0].text.lower())
 
+    async def test_api_error_result_routes_to_fail_not_done(self):
+        """Regression for audit S8c finding (8/17 sweep, task 6b0be48b...):
+        the Claude Agent SDK returns a surfaced API error (e.g. 529
+        overloaded_error) as normal ResultMessage content -- it never raises,
+        so ClaudeResponse.is_error stays False and the runner returns a
+        'successful' RunOutcome. The dispatcher must still classify that
+        content as a failure and never call board.complete() with it."""
+        board = FakeBoard()
+        board.add(title="pipeline sweep", chat_id="9")
+        runner = FakeRunner(lambda t: RunOutcome(
+            content=(
+                'API Error: 529 {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}'
+            )
+        ))
+        bus = FakeEventBus()
+        d = make_dispatcher(board, runner, bus)
+
+        await d.tick()
+
+        task = list(board.tasks.values())[0]
+        self.assertEqual(task["status"], FAILED)
+        self.assertIn("overloaded_error", task["error"])
+        self.assertEqual(len(bus.published), 1)
+        self.assertIn("failed", bus.published[0].text.lower())
+
     async def test_done_without_chat_id_does_not_notify(self):
         board = FakeBoard()
         board.add(title="internal", chat_id=None)
@@ -307,6 +333,29 @@ class DispatcherTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("2/3 subtasks complete · 1 failed", text)
         self.assertIn("✓ Enrich Nicole", text)
         self.assertIn("✗ Book room", text)
+
+
+class ResultIsFailureTest(unittest.TestCase):
+    """Unit coverage for the classifier itself (audit S8c, Step 4 of the fix)."""
+
+    def test_api_error_text_is_a_failure(self):
+        self.assertTrue(result_is_failure(
+            'API Error: 529 {"type":"overloaded_error"}'
+        ))
+
+    def test_normal_completion_text_is_not_a_failure(self):
+        self.assertFalse(result_is_failure("Recap created, 2 tasks"))
+
+    def test_none_is_not_a_failure(self):
+        self.assertFalse(result_is_failure(None))
+
+    def test_empty_string_is_not_a_failure(self):
+        self.assertFalse(result_is_failure(""))
+
+    def test_timeout_marker_is_a_failure(self):
+        self.assertTrue(result_is_failure(
+            "ClaudeTimeoutError: Claude SDK timed out after 600s"
+        ))
 
 
 # ----------------------------------------------------- integration (real board)

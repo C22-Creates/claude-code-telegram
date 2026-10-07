@@ -19,12 +19,14 @@ from ...config.settings import Settings
 from ...security.audit import AuditLogger
 from ...security.rate_limiter import RateLimiter
 from ...security.validators import SecurityValidator
+from ..utils.formatting import with_stop_reason
 from ..utils.html_format import escape_html
 from ..utils.image_extractor import (
     ImageAttachment,
     should_send_as_photo,
     validate_image_path,
 )
+from ..utils.session_scope import scope_key_from_context, topic_agent_from_context
 
 logger = structlog.get_logger()
 
@@ -396,6 +398,8 @@ async def handle_text_message(
                 prompt=message_text,
                 working_directory=current_dir,
                 user_id=user_id,
+                scope_key=scope_key_from_context(context),
+                topic_agent=topic_agent_from_context(context),
                 session_id=session_id,
                 on_stream=stream_handler,
                 force_new=force_new,
@@ -431,7 +435,7 @@ async def handle_text_message(
 
             formatter = ResponseFormatter(settings)
             formatted_messages = formatter.format_claude_response(
-                claude_response.content
+                with_stop_reason(claude_response)
             )
 
         except Exception as e:
@@ -823,6 +827,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 prompt=prompt,
                 working_directory=current_dir,
                 user_id=user_id,
+                scope_key=scope_key_from_context(context),
+                topic_agent=topic_agent_from_context(context),
                 session_id=session_id,
             )
 
@@ -839,7 +845,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
             formatter = ResponseFormatter(settings)
             formatted_messages = formatter.format_claude_response(
-                claude_response.content
+                with_stop_reason(claude_response)
             )
 
             # Delete progress message
@@ -950,6 +956,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                     prompt=processed_image.prompt,
                     working_directory=current_dir,
                     user_id=user_id,
+                    scope_key=scope_key_from_context(context),
+                topic_agent=topic_agent_from_context(context),
                     session_id=session_id,
                 )
 
@@ -961,7 +969,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
                 formatter = ResponseFormatter(settings)
                 formatted_messages = formatter.format_claude_response(
-                    claude_response.content
+                    with_stop_reason(claude_response)
                 )
 
                 # Delete progress message
@@ -1078,6 +1086,8 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 prompt=processed_voice.prompt,
                 working_directory=current_dir,
                 user_id=user_id,
+                scope_key=scope_key_from_context(context),
+                topic_agent=topic_agent_from_context(context),
                 session_id=session_id,
             )
 
@@ -1091,7 +1101,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
             formatter = ResponseFormatter(settings)
             formatted_messages = formatter.format_claude_response(
-                claude_response.content
+                with_stop_reason(claude_response)
             )
 
             await progress_msg.delete()
