@@ -51,6 +51,12 @@ def setup_logging(debug: bool = False) -> None:
         stream=sys.stdout,
     )
 
+    # httpx logs every request URL at INFO, and Telegram Bot API URLs embed the
+    # bot token (/bot<token>/getUpdates), so INFO-level httpx output writes the
+    # token into journald on every poll. Warnings and errors still come through.
+    for noisy in ("httpx", "httpcore"):
+        logging.getLogger(noisy).setLevel(max(level, logging.WARNING))
+
     # Configure structlog
     structlog.configure(
         processors=[
