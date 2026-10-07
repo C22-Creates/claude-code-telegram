@@ -5,7 +5,16 @@ import os
 import signal
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, AsyncIterator, Callable, Dict, List, Optional
+from typing import (
+    Any,
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Dict,
+    FrozenSet,
+    List,
+    Optional,
+)
 
 import structlog
 from claude_agent_sdk import (
@@ -59,6 +68,59 @@ CANCELLED_TASK_CLEANUP_TIMEOUT = 10.0
 # survive as orphans if only the direct child is killed. The cap is a guard
 # against a pathological /proc walk, not an expected limit.
 MAX_REAPED_DESCENDANTS = 64
+# Fallback message when a run stopped early without producing any text. The
+# stop-reason footer carries the warning and the reason, so this only reports
+# what the run got done -- otherwise the two stack up as "stopped" twice.
+TASK_STOPPED_MSG = "No final response. Tools used: {tools_summary}"
+
+# ResultMessage.subtype reported by the CLI for a run that ran to completion.
+RESULT_SUBTYPE_SUCCESS = "success"
+
+
+def _as_error_list(value: Any) -> List[str]:
+    """Normalise ResultMessage.errors into a list of strings."""
+    if not value:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list):
+        return [str(item) for item in value if item]
+    return [str(value)]
+
+
+def _as_denial_list(value: Any) -> List[Dict[str, Any]]:
+    """Normalise ResultMessage.permission_denials into a list of dicts.
+
+    The SDK types this ``list[Any]`` and passes the CLI payload through
+    untouched, so accept both snake_case and camelCase keys and tolerate
+    entries that are not dicts at all.
+    """
+    if not value or not isinstance(value, list):
+        return []
+
+    denials: List[Dict[str, Any]] = []
+    for item in value:
+        if isinstance(item, dict):
+            tool_name = item.get("tool_name") or item.get("toolName")
+            tool_input = item.get("tool_input")
+            if tool_input is None:
+                tool_input = item.get("toolInput")
+            denials.append(
+                {
+                    "tool_name": str(tool_name) if tool_name else "unknown",
+                    "tool_input": tool_input if isinstance(tool_input, dict) else {},
+                }
+            )
+        else:
+            name = getattr(item, "tool_name", None)
+            tool_input = getattr(item, "tool_input", None)
+            denials.append(
+                {
+                    "tool_name": str(name) if name else "unknown",
+                    "tool_input": tool_input if isinstance(tool_input, dict) else {},
+                }
+            )
+    return denials
 
 
 @dataclass
@@ -74,6 +136,23 @@ class ClaudeResponse:
     error_type: Optional[str] = None
     tools_used: List[Dict[str, Any]] = field(default_factory=list)
     interrupted: bool = False
+    # Why the run ended.  All optional so existing construction sites keep
+    # working; populated from ResultMessage when the SDK reports them.
+    result_subtype: Optional[str] = None
+    stop_reason: Optional[str] = None
+    terminal_reason: Optional[str] = None
+    errors: List[str] = field(default_factory=list)
+    permission_denials: List[Dict[str, Any]] = field(default_factory=list)
+
+    @property
+    def completed_normally(self) -> bool:
+        """Whether the run reached its own end rather than being cut short.
+
+        ``None`` means the CLI reported no subtype at all (older versions, or a
+        result that bypassed the query loop), which we treat as normal so that
+        nothing regresses into a spurious warning.
+        """
+        return self.result_subtype in (None, RESULT_SUBTYPE_SUCCESS)
 
 
 @dataclass
@@ -192,27 +271,67 @@ class StreamUpdate:
         return None
 
 
+# Tools whose file path the can_use_tool callback validates against the
+# approved directory.
+FILE_TOOLS = frozenset(
+    {
+        "Write",
+        "Edit",
+        "MultiEdit",
+        "Read",
+        "NotebookEdit",
+        "NotebookRead",
+        "create_file",
+        "edit_file",
+        "read_file",
+    }
+)
+
+# Tools whose command the can_use_tool callback checks for directory escapes.
+BASH_TOOLS = frozenset({"Bash", "bash", "shell"})
+
+# Every tool the callback actually guards. These must be kept out of the
+# ``allowed_tools`` list handed to the SDK: the CLI's permission engine resolves
+# allow rules before consulting the permission prompt tool, so a tool named in
+# ``allowed_tools`` is pre-approved and never produces a ``can_use_tool``
+# control request -- leaving the checks below inert. See issue #219.
+GUARDED_TOOLS = FILE_TOOLS | BASH_TOOLS
+
+# Keys under which the guarded file tools pass their target path.
+_FILE_PATH_KEYS = ("file_path", "path", "notebook_path")
+
+
 def _make_can_use_tool_callback(
     security_validator: SecurityValidator,
     working_directory: Path,
     approved_directory: Path,
+    approval_callback: Optional[
+        Callable[[str, Dict[str, Any]], Awaitable[bool]]
+    ] = None,
+    approval_tool_names: FrozenSet[str] = frozenset(),
 ) -> Any:
     """Create a can_use_tool callback for SDK-level tool permission validation.
 
     The callback validates file path boundaries and bash directory boundaries
     *before* the SDK executes the tool, providing preventive security enforcement.
+    If `approval_callback` is set, tools in `approval_tool_names` additionally
+    require interactive human approval (e.g. via a Telegram Allow/Deny prompt)
+    after the static checks pass.
     """
-    _FILE_TOOLS = {"Write", "Edit", "Read", "create_file", "edit_file", "read_file"}
-    _BASH_TOOLS = {"Bash", "bash", "shell"}
 
     async def can_use_tool(
         tool_name: str,
         tool_input: Dict[str, Any],
         context: ToolPermissionContext,
     ) -> Any:
+        logger.debug("can_use_tool consulted", tool_name=tool_name)
+
         # File path validation
-        if tool_name in _FILE_TOOLS:
-            file_path = tool_input.get("file_path") or tool_input.get("path")
+        if tool_name in FILE_TOOLS:
+            file_path = next(
+                (tool_input.get(key) for key in _FILE_PATH_KEYS if tool_input.get(key)),
+                None,
+            )
             if file_path:
                 # Allow Claude Code internal paths (~/.claude/plans/, etc.)
                 if _is_claude_internal_path(file_path):
@@ -231,7 +350,7 @@ def _make_can_use_tool_callback(
                     return PermissionResultDeny(message=error or "Invalid file path")
 
         # Bash directory boundary validation
-        if tool_name in _BASH_TOOLS:
+        if tool_name in BASH_TOOLS:
             command = tool_input.get("command", "")
             if command:
                 valid, error = check_bash_directory_boundary(
@@ -247,6 +366,16 @@ def _make_can_use_tool_callback(
                     return PermissionResultDeny(
                         message=error or "Bash directory boundary violation"
                     )
+
+        # Interactive human-in-the-loop approval for configured tools
+        if approval_callback is not None and tool_name in approval_tool_names:
+            approved = await approval_callback(tool_name, tool_input)
+            if not approved:
+                logger.info(
+                    "can_use_tool denied by interactive approval",
+                    tool_name=tool_name,
+                )
+                return PermissionResultDeny(message="Denied by user via Telegram")
 
         return PermissionResultAllow()
 
@@ -452,6 +581,9 @@ class ClaudeSDKManager:
         model: Optional[str] = None,
         extra_disallowed_tools: Optional[List[str]] = None,
         topic_agent: Optional[str] = None,
+        approval_callback: Optional[
+            Callable[[str, Dict[str, Any]], Awaitable[bool]]
+        ] = None,
     ) -> ClaudeResponse:
         """Execute Claude Code command via SDK."""
         start_time = asyncio.get_event_loop().time()
@@ -492,9 +624,7 @@ class ClaudeSDKManager:
             # working dir, so path-keying misidentifies the topic (live
             # incident 2026-09-04: Relationships session booted as coach and
             # had every Missive tool denied).
-            if topic_agent and bool(
-                getattr(self.config, "agent_loader_enabled", True)
-            ):
+            if topic_agent and bool(getattr(self.config, "agent_loader_enabled", True)):
                 from ..dispatcher.agent_loader import load_agent
 
                 identity, topic_denied = load_agent(
@@ -518,14 +648,69 @@ class ClaudeSDKManager:
                             would_deny=topic_denied,
                         )
 
-            # When DISABLE_TOOL_VALIDATION=true, pass None for allowed/disallowed
-            # tools so the SDK does not restrict tool usage (e.g. MCP tools).
+            # Always pass a list (never None) for allowed/disallowed tools.
+            # ClaudeAgentOptions declares both as list[str] with
+            # default_factory=list. 0.1.x guarded with a truthiness check and
+            # tolerated None; 0.2 does not -- the transport calls
+            # list(options.allowed_tools), and the connect-time shadowing
+            # check iterates it, so None raises TypeError before the CLI even
+            # starts. Both settings are Optional, and a true
+            # DISABLE_TOOL_VALIDATION deliberately sends nothing (#206), so
+            # normalise every path to a list. [] and None are both falsy, so
+            # the CLI omits the flags either way.
+            sdk_allowed_tools: List[str]
+            sdk_disallowed_tools: List[str]
             if self.config.disable_tool_validation:
-                sdk_allowed_tools = None
-                sdk_disallowed_tools = None
+                sdk_allowed_tools = []
+                sdk_disallowed_tools = []
             else:
-                sdk_allowed_tools = self.config.claude_allowed_tools
-                sdk_disallowed_tools = self.config.claude_disallowed_tools
+                sdk_allowed_tools = list(self.config.claude_allowed_tools or [])
+                sdk_disallowed_tools = list(self.config.claude_disallowed_tools or [])
+
+            # The can_use_tool callback below is purely reactive: the SDK only
+            # invokes it when the CLI sends a can_use_tool control request, and
+            # the CLI resolves allow rules first. Any guarded tool left in
+            # allowed_tools is therefore pre-approved and its boundary check
+            # never runs. Strip them so each call is routed to the callback,
+            # which allows everything that passes validation. Issue #219.
+            boundary_checks_active = (
+                self.security_validator is not None
+                and not self.config.disable_tool_validation
+            )
+
+            # Interactive approval has the same requirement for its own gated
+            # tools: a tool left in allowed_tools is pre-approved by the CLI
+            # and never reaches can_use_tool, so the approval prompt (and the
+            # static checks above) would never fire for it. This can gate
+            # tools beyond GUARDED_TOOLS (INTERACTIVE_TOOL_APPROVAL_TOOLS is
+            # user-configured), so it is a separate, additive strip.
+            approval_tool_names_set: FrozenSet[str] = frozenset()
+            if self.config.interactive_tool_approval:
+                approval_tool_names_set = frozenset(
+                    self.config.interactive_tool_approval_tools or ()
+                )
+
+            tools_to_strip: FrozenSet[str] = approval_tool_names_set
+            if boundary_checks_active:
+                tools_to_strip = tools_to_strip | GUARDED_TOOLS
+
+            if tools_to_strip:
+                gated = [t for t in sdk_allowed_tools if t in tools_to_strip]
+                if gated:
+                    sdk_allowed_tools = [
+                        tool for tool in sdk_allowed_tools if tool not in tools_to_strip
+                    ]
+                    logger.debug(
+                        "Routing guarded tools through can_use_tool",
+                        gated_tools=gated,
+                    )
+
+            # The SDK auto-approves sandboxed Bash calls without ever invoking
+            # can_use_tool (see ClaudeAgentOptions sandbox settings). That is
+            # a second bypass of both the bash-boundary check and the
+            # interactive-approval prompt, so it must be disabled whenever
+            # either of those depends on Bash going through can_use_tool.
+            bash_needs_approval = "Bash" in approval_tool_names_set
 
             # Agent-level hard denials (dispatcher loader, agents/scoping.md)
             # apply even when config-level tool validation is disabled — they
@@ -552,7 +737,13 @@ class ClaudeSDKManager:
                 include_partial_messages=stream_callback is not None,
                 sandbox={
                     "enabled": self.config.sandbox_enabled,
-                    "autoAllowBashIfSandboxed": True,
+                    # Auto-approving sandboxed bash is a second bypass of the
+                    # control request the bash boundary check (and, if Bash is
+                    # gated, the approval prompt) depends on, so it stays off
+                    # whenever either is meant to run (#219).
+                    "autoAllowBashIfSandboxed": not (
+                        boundary_checks_active or bash_needs_approval
+                    ),
                     "excludedCommands": self.config.sandbox_excluded_commands or [],
                 },
                 system_prompt=base_prompt,
@@ -574,6 +765,12 @@ class ClaudeSDKManager:
                     security_validator=self.security_validator,
                     working_directory=working_directory,
                     approved_directory=self.config.approved_directory,
+                    approval_callback=(
+                        approval_callback
+                        if self.config.interactive_tool_approval
+                        else None
+                    ),
+                    approval_tool_names=approval_tool_names_set,
                 )
 
             # Resume previous session if we have a session_id
@@ -811,16 +1008,32 @@ class ClaudeSDKManager:
                 if last_exc is not None:
                     raise last_exc
 
-            # Extract cost, tools, and session_id from result message
+            # Extract cost, tools, session_id and stop reason from result message
             cost = 0.0
             tools_used: List[Dict[str, Any]] = []
             claude_session_id = None
             result_content = None
+            result_subtype: Optional[str] = None
+            result_num_turns: Optional[int] = None
+            stop_reason: Optional[str] = None
+            terminal_reason: Optional[str] = None
+            result_errors: List[str] = []
+            permission_denials: List[Dict[str, Any]] = []
             for message in messages:
                 if isinstance(message, ResultMessage):
                     cost = getattr(message, "total_cost_usd", 0.0) or 0.0
                     claude_session_id = getattr(message, "session_id", None)
                     result_content = getattr(message, "result", None)
+                    # getattr (not attribute access) throughout: older CLI
+                    # versions and the test doubles omit these fields.
+                    result_subtype = getattr(message, "subtype", None)
+                    result_num_turns = getattr(message, "num_turns", None)
+                    stop_reason = getattr(message, "stop_reason", None)
+                    terminal_reason = getattr(message, "terminal_reason", None)
+                    result_errors = _as_error_list(getattr(message, "errors", None))
+                    permission_denials = _as_denial_list(
+                        getattr(message, "permission_denials", None)
+                    )
                     current_time = asyncio.get_event_loop().time()
                     for msg in messages:
                         if isinstance(msg, AssistantMessage):
@@ -881,6 +1094,8 @@ class ClaudeSDKManager:
                             content_parts.append(str(msg_content))
                 content = "\n".join(content_parts).strip()
 
+            ran_to_completion = result_subtype in (None, RESULT_SUBTYPE_SUCCESS)
+
             if not content and tools_used:
                 tool_names = [
                     tool.get("name", "")
@@ -889,22 +1104,54 @@ class ClaudeSDKManager:
                 ]
                 unique_tool_names = list(dict.fromkeys(tool_names))
                 tools_summary = ", ".join(unique_tool_names) or "unknown"
-                content = TASK_COMPLETED_MSG.format(tools_summary=tools_summary)
+                # Only claim completion when the CLI says the run completed.
+                # A run killed at the turn limit takes this same path (tools
+                # ran, no final text) and must not report success (#172).
+                template = TASK_COMPLETED_MSG if ran_to_completion else TASK_STOPPED_MSG
+                content = template.format(tools_summary=tools_summary)
+
+            # The CLI reports the authoritative turn count. Counting messages
+            # over-reports it -- every tool result arrives as another
+            # UserMessage -- and that number is now shown to the user in the
+            # stop-reason footer, so the approximation is only a fallback for
+            # a result that did not carry one.
+            if isinstance(result_num_turns, int) and result_num_turns >= 0:
+                num_turns = result_num_turns
+            else:
+                num_turns = len(
+                    [
+                        m
+                        for m in messages
+                        if isinstance(m, (UserMessage, AssistantMessage))
+                    ]
+                )
+
+            if not ran_to_completion or permission_denials or result_errors:
+                logger.info(
+                    "Claude run did not end cleanly",
+                    result_subtype=result_subtype,
+                    stop_reason=stop_reason,
+                    terminal_reason=terminal_reason,
+                    permission_denials=len(permission_denials),
+                    denied_tools=[d["tool_name"] for d in permission_denials],
+                    errors=result_errors,
+                    num_turns=num_turns,
+                    session_id=final_session_id,
+                )
 
             return ClaudeResponse(
                 content=content,
                 session_id=final_session_id,
                 cost=cost,
                 duration_ms=duration_ms,
-                num_turns=len(
-                    [
-                        m
-                        for m in messages
-                        if isinstance(m, (UserMessage, AssistantMessage))
-                    ]
-                ),
+                num_turns=num_turns,
                 tools_used=tools_used,
                 interrupted=interrupted,
+                result_subtype=result_subtype,
+                stop_reason=stop_reason,
+                terminal_reason=terminal_reason,
+                errors=result_errors,
+                permission_denials=permission_denials,
             )
 
         except asyncio.TimeoutError:

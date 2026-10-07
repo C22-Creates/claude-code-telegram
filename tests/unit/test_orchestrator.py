@@ -151,8 +151,8 @@ def test_agentic_registers_text_document_photo_handlers(agentic_settings, deps):
 
     # 5 message handlers (text, document, photo, voice, unknown commands passthrough)
     assert len(msg_handlers) == 5
-    # 2 callback handlers (stop: + cd:)
-    assert len(cb_handlers) == 2
+    # 3 callback handlers (stop: + tapv: + cd:)
+    assert len(cb_handlers) == 3
 
 
 async def test_agentic_bot_commands(agentic_settings, deps):
@@ -338,7 +338,7 @@ async def test_agentic_callback_scoped_to_cd_pattern(agentic_settings, deps):
         if isinstance(call[0][0], CallbackQueryHandler)
     ]
 
-    assert len(cb_handlers) == 2
+    assert len(cb_handlers) == 3
     # Find the cd: handler by pattern
     cd_handler = [h for h in cb_handlers if h.pattern and h.pattern.match("cd:x")]
     assert len(cd_handler) == 1
@@ -346,6 +346,11 @@ async def test_agentic_callback_scoped_to_cd_pattern(agentic_settings, deps):
     # Also has a stop: handler
     stop_handler = [h for h in cb_handlers if h.pattern and h.pattern.match("stop:1")]
     assert len(stop_handler) == 1
+    # Also has a tapv: handler
+    tapv_handler = [
+        h for h in cb_handlers if h.pattern and h.pattern.match("tapv:allow:x")
+    ]
+    assert len(tapv_handler) == 1
 
 
 async def test_agentic_document_rejects_large_files(agentic_settings, deps):
@@ -625,6 +630,51 @@ class TestRedactSecrets:
             "Read", {"file_path": "/home/user/.env"}
         )
         assert result == ".env"
+
+
+class TestSummarizeToolInputForApproval:
+    """_summarize_tool_input_for_approval shows full detail for security decisions."""
+
+    def test_write_shows_full_path_not_just_filename(self, agentic_settings, deps):
+        orchestrator = MessageOrchestrator(agentic_settings, deps)
+        result = orchestrator._summarize_tool_input_for_approval(
+            "Write", {"file_path": "/home/user/project/settings.py"}
+        )
+        assert result == "/home/user/project/settings.py"
+
+    def test_edit_shows_full_path(self, agentic_settings, deps):
+        orchestrator = MessageOrchestrator(agentic_settings, deps)
+        result = orchestrator._summarize_tool_input_for_approval(
+            "Edit", {"file_path": "/etc/secrets/config.yaml"}
+        )
+        assert result == "/etc/secrets/config.yaml"
+
+    def test_bash_short_command_not_truncated(self, agentic_settings, deps):
+        orchestrator = MessageOrchestrator(agentic_settings, deps)
+        result = orchestrator._summarize_tool_input_for_approval(
+            "Bash", {"command": "echo hi"}
+        )
+        assert result == "echo hi"
+
+    def test_bash_long_command_truncated_at_1000_with_marker(
+        self, agentic_settings, deps
+    ):
+        orchestrator = MessageOrchestrator(agentic_settings, deps)
+        long_cmd = "echo " + ("a" * 2000)
+        result = orchestrator._summarize_tool_input_for_approval(
+            "Bash", {"command": long_cmd}
+        )
+        assert len(result) == 1001  # 1000 chars + the "…" marker
+        assert result.endswith("…")
+
+    def test_bash_redacts_secrets(self, agentic_settings, deps):
+        orchestrator = MessageOrchestrator(agentic_settings, deps)
+        result = orchestrator._summarize_tool_input_for_approval(
+            "Bash",
+            {"command": "curl --token=mysupersecrettoken123 https://api.example.com"},
+        )
+        assert "mysupersecrettoken123" not in result
+        assert "***" in result
 
 
 # --- Typing heartbeat tests ---
@@ -990,3 +1040,129 @@ async def test_bot_suffixed_command_not_forwarded(agentic_settings, deps):
     ) as mock_claude:
         await orchestrator._handle_unknown_command(update, context)
         mock_claude.assert_not_called()
+
+
+async def _run_agentic_text_with(claude_response, agentic_settings, deps):
+    """Drive agentic_text with a given ClaudeResponse and return the texts sent."""
+    orchestrator = MessageOrchestrator(agentic_settings, deps)
+
+    claude_integration = AsyncMock()
+    claude_integration.run_command = AsyncMock(return_value=claude_response)
+
+    update = MagicMock()
+    update.effective_user.id = 123
+    update.message.text = "Do something big"
+    update.message.message_id = 1
+    update.message.chat.send_action = AsyncMock()
+    update.message.reply_text = AsyncMock()
+
+    progress_msg = AsyncMock()
+    progress_msg.delete = AsyncMock()
+    update.message.reply_text.return_value = progress_msg
+
+    context = MagicMock()
+    context.user_data = {}
+    context.bot_data = {
+        "settings": agentic_settings,
+        "claude_integration": claude_integration,
+        "storage": None,
+        "rate_limiter": None,
+        "audit_logger": None,
+    }
+
+    await orchestrator.agentic_text(update, context)
+
+    # The first reply_text call is the progress message, not a response.
+    return [
+        call.args[0]
+        for call in update.message.reply_text.call_args_list[1:]
+        if call.args
+    ]
+
+
+async def test_agentic_text_reports_turn_limit(agentic_settings, deps):
+    """A run killed at the turn limit says so instead of claiming success (#172)."""
+    from src.claude.sdk_integration import ClaudeResponse
+
+    response = ClaudeResponse(
+        content="Started refactoring...",
+        session_id="session-abc",
+        cost=0.1,
+        duration_ms=100,
+        num_turns=10,
+        result_subtype="error_max_turns",
+        terminal_reason="max_turns",
+    )
+
+    sent = await _run_agentic_text_with(response, agentic_settings, deps)
+
+    assert sent, "expected a response message"
+    body = "\n".join(sent)
+    assert "turn limit reached after 10 turns" in body
+    assert "Send a message to continue" in body
+
+
+async def test_agentic_text_lists_blocked_tool_calls(agentic_settings, deps):
+    """Denials the bot itself generated are reported to the user."""
+    from src.claude.sdk_integration import ClaudeResponse
+
+    response = ClaudeResponse(
+        content="I could not write that file.",
+        session_id="session-abc",
+        cost=0.1,
+        duration_ms=100,
+        num_turns=2,
+        result_subtype="success",
+        permission_denials=[
+            {"tool_name": "Write", "tool_input": {"file_path": "/etc/hosts"}}
+        ],
+    )
+
+    sent = await _run_agentic_text_with(response, agentic_settings, deps)
+
+    body = "\n".join(sent)
+    assert "1 tool call was blocked" in body
+    assert "/etc/hosts" in body
+
+
+async def test_agentic_text_adds_no_footer_to_a_clean_run(agentic_settings, deps):
+    """A run that finished normally reads exactly as it did before."""
+    from src.claude.sdk_integration import ClaudeResponse
+
+    response = ClaudeResponse(
+        content="All done.",
+        session_id="session-abc",
+        cost=0.1,
+        duration_ms=100,
+        num_turns=2,
+        result_subtype="success",
+    )
+
+    sent = await _run_agentic_text_with(response, agentic_settings, deps)
+
+    body = "\n".join(sent)
+    assert "Stopped" not in body
+    assert "blocked" not in body
+
+
+async def test_agentic_text_does_not_say_stopped_twice(agentic_settings, deps):
+    """The turn-limit-mid-tool-use case: no final text, so the placeholder
+    stands in for the reply and the footer explains. One warning, not two."""
+    from src.claude.sdk_integration import TASK_STOPPED_MSG, ClaudeResponse
+
+    response = ClaudeResponse(
+        content=TASK_STOPPED_MSG.format(tools_summary="Bash, Read"),
+        session_id="session-abc",
+        cost=0.1,
+        duration_ms=100,
+        num_turns=10,
+        result_subtype="error_max_turns",
+        terminal_reason="max_turns",
+    )
+
+    sent = await _run_agentic_text_with(response, agentic_settings, deps)
+
+    body = "\n".join(sent)
+    assert "No final response. Tools used: Bash, Read" in body
+    assert "turn limit reached after 10 turns" in body
+    assert body.count("⚠️") == 1

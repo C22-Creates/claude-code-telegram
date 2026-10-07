@@ -53,9 +53,26 @@ AUTH_TOKEN_SECRET=your-secret-key-here
 # WARNING: This allows characters such as pipes and redirections in validated paths.
 DISABLE_SECURITY_PATTERNS=false
 
-# Disable ToolMonitor allowlist/disallowlist checks (default: false)
-# WARNING: This only skips tool-name allow/disallow checks; path and Bash safety checks still apply.
+# Disable Claude tool validation (default: false)
+# WARNING: This skips the tool allow/disallow lists AND the pre-execution path and
+# Bash directory boundary checks on Claude's own tool calls. Trusted environments only.
 DISABLE_TOOL_VALIDATION=false
+```
+
+#### Interactive Tool Approval
+
+```bash
+# Require interactive Telegram Allow/Deny approval before executing risky tool calls (default: false)
+INTERACTIVE_TOOL_APPROVAL=false
+
+# Comma-separated tool names gated behind approval when enabled (default: Bash,Write,Edit)
+INTERACTIVE_TOOL_APPROVAL_TOOLS=Bash,Write,Edit
+
+# Seconds to wait for a response before applying the timeout action (default: 60)
+INTERACTIVE_TOOL_APPROVAL_TIMEOUT_SECONDS=60
+
+# Decision applied automatically on timeout: deny (fail-closed) or allow (default: deny)
+INTERACTIVE_TOOL_APPROVAL_TIMEOUT_ACTION=deny
 ```
 
 #### Claude Configuration

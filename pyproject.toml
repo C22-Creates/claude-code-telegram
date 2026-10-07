@@ -1,6 +1,6 @@
 [project]
 name = "claude-code-telegram"
-version = "1.6.0"
+version = "1.8.0"
 description = "Telegram bot for remote Claude Code access with comprehensive configuration management"
 readme = "README.md"
 license = "MIT"
@@ -23,9 +23,9 @@ requires-python = ">=3.11"
 dynamic = ["dependencies"]
 
 [project.urls]
-Homepage = "https://github.com/richardatkinson/claude-code-telegram"
-Repository = "https://github.com/richardatkinson/claude-code-telegram"
-Documentation = "https://github.com/richardatkinson/claude-code-telegram/blob/main/docs/"
+Homepage = "https://github.com/overwirehq/claude-code-telegram"
+Repository = "https://github.com/overwirehq/claude-code-telegram"
+Documentation = "https://github.com/overwirehq/claude-code-telegram/blob/main/docs/"
 
 [project.scripts]
 claude-telegram-bot = "src.main:run"
@@ -39,7 +39,7 @@ packages = [{include = "src"}]
 
 [tool.poetry.dependencies]
 python = "^3.11"
-python-telegram-bot = {version = "^22.6", extras = ["rate-limiter"]}
+python-telegram-bot = {version = "^22.6", extras = ["rate-limiter", "webhooks"]}
 structlog = "^25.4.0"
 pydantic = "^2.11.5"
 pydantic-settings = "^2.9.1"
@@ -47,7 +47,7 @@ python-dotenv = "^1.0.0"
 aiofiles = "^24.1.0"
 aiosqlite = "^0.21.0"
 anthropic = "^0.40.0"
-claude-agent-sdk = "^0.1.39"
+claude-agent-sdk = "^0.2.157"
 fastapi = "^0.115.0"
 uvicorn = {version = "^0.34.0", extras = ["standard"]}
 apscheduler = "^3.10"

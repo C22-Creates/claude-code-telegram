@@ -5,7 +5,7 @@ Provides simple interface for bot handlers.
 
 import asyncio
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 import structlog
 
@@ -61,6 +61,9 @@ class ClaudeIntegration:
         scope_key: Optional[str] = None,
         extra_disallowed_tools: Optional[List[str]] = None,
         topic_agent: Optional[str] = None,
+        approval_callback: Optional[
+            Callable[[str, Dict[str, Any]], Awaitable[bool]]
+        ] = None,
     ) -> ClaudeResponse:
         """Run Claude Code command with full integration."""
         async with self._conversation_lock(user_id, working_directory, scope_key):
@@ -77,6 +80,7 @@ class ClaudeIntegration:
                 scope_key=scope_key,
                 extra_disallowed_tools=extra_disallowed_tools,
                 topic_agent=topic_agent,
+                approval_callback=approval_callback,
             )
 
     async def _run_command_locked(
@@ -93,6 +97,9 @@ class ClaudeIntegration:
         scope_key: Optional[str] = None,
         extra_disallowed_tools: Optional[List[str]] = None,
         topic_agent: Optional[str] = None,
+        approval_callback: Optional[
+            Callable[[str, Dict[str, Any]], Awaitable[bool]]
+        ] = None,
     ) -> ClaudeResponse:
         """Run one command. Caller holds the conversation lock."""
         logger.info(
@@ -148,6 +155,7 @@ class ClaudeIntegration:
                     model=model,
                     extra_disallowed_tools=extra_disallowed_tools,
                     topic_agent=topic_agent,
+                    approval_callback=approval_callback,
                 )
             except ClaudeTimeoutError:
                 # A timeout says the turn was too slow — NOT that the session is
@@ -189,6 +197,7 @@ class ClaudeIntegration:
                         interrupt_event=interrupt_event,
                         images=images,
                         model=model,
+                        approval_callback=approval_callback,
                     )
                 else:
                     raise
@@ -237,6 +246,9 @@ class ClaudeIntegration:
         model: Optional[str] = None,
         extra_disallowed_tools: Optional[List[str]] = None,
         topic_agent: Optional[str] = None,
+        approval_callback: Optional[
+            Callable[[str, Dict[str, Any]], Awaitable[bool]]
+        ] = None,
     ) -> ClaudeResponse:
         """Execute command via SDK."""
         return await self.sdk_manager.execute_command(
@@ -250,6 +262,7 @@ class ClaudeIntegration:
             model=model,
             extra_disallowed_tools=extra_disallowed_tools,
             topic_agent=topic_agent,
+            approval_callback=approval_callback,
         )
 
     async def _find_resumable_session(
