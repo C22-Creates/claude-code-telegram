@@ -73,6 +73,11 @@ MAX_REAPED_DESCENDANTS = 64
 # what the run got done -- otherwise the two stack up as "stopped" twice.
 TASK_STOPPED_MSG = "No final response. Tools used: {tools_summary}"
 
+# Appended after CLAUDE.md on every run, in this order. Routing and verified tool
+# syntax must be in front of the agent every time; on-demand files went unread and
+# lookups thrashed (c22os failure-modes #41). Missing files are skipped.
+ALWAYS_LOADED_CONTEXT = ("context/intent-map.md", "context/tool-recipes.md")
+
 # ResultMessage.subtype reported by the CLI for a run that ran to completion.
 RESULT_SUBTYPE_SUCCESS = "success"
 
@@ -615,6 +620,14 @@ class ClaudeSDKManager:
                     "Loaded CLAUDE.md into system prompt",
                     path=str(claude_md_path),
                 )
+            for rel_path in ALWAYS_LOADED_CONTEXT:
+                context_path = Path(working_directory) / rel_path
+                if context_path.exists():
+                    base_prompt += "\n\n" + context_path.read_text(encoding="utf-8")
+                else:
+                    logger.warning(
+                        "Always-loaded context file missing", path=str(context_path)
+                    )
 
             # Per-topic agent identity (agents/README.md § Loader contract):
             # callers that know their topic's declared agent (the Telegram

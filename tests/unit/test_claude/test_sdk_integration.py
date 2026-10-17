@@ -1823,6 +1823,42 @@ class TestClaudeMdLoading:
         assert "# Project Rules" in opts.system_prompt
         assert "Always use type hints." in opts.system_prompt
 
+    async def _system_prompt_for(self, sdk_manager, tmp_path) -> str:
+        captured: list = []
+        mock_factory = _mock_client_factory(
+            _make_assistant_message("ok"),
+            _make_result_message(),
+            capture_options=captured,
+        )
+        with patch(
+            "src.claude.sdk_integration.ClaudeSDKClient", side_effect=mock_factory
+        ):
+            await sdk_manager.execute_command(prompt="test", working_directory=tmp_path)
+        return captured[0].system_prompt
+
+    async def test_context_files_appended_after_claude_md(self, sdk_manager, tmp_path):
+        """Always-loaded context files follow CLAUDE.md, in a fixed order."""
+        (tmp_path / "CLAUDE.md").write_text("# Rules")
+        (tmp_path / "context").mkdir()
+        (tmp_path / "context" / "intent-map.md").write_text("# Intent map")
+        (tmp_path / "context" / "tool-recipes.md").write_text("# Recipes")
+
+        prompt = await self._system_prompt_for(sdk_manager, tmp_path)
+
+        rules = prompt.index("# Rules")
+        intent = prompt.index("# Intent map")
+        recipes = prompt.index("# Recipes")
+        assert rules < intent < recipes
+
+    async def test_missing_context_files_skipped(self, sdk_manager, tmp_path):
+        """A checkout without the context files still boots with CLAUDE.md only."""
+        (tmp_path / "CLAUDE.md").write_text("# Rules")
+
+        prompt = await self._system_prompt_for(sdk_manager, tmp_path)
+
+        assert "# Rules" in prompt
+        assert "# Intent map" not in prompt
+
     async def test_system_prompt_unchanged_without_claude_md(
         self, sdk_manager, tmp_path
     ):
