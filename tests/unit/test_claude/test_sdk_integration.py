@@ -2273,10 +2273,10 @@ class TestNumTurns:
 class TestEndTurnGrace:
     """A finished turn must reach the user even if the CLI never sends its result.
 
-    Live incident 2026-10-17: in resumed sessions the CLI wrote the final
-    assistant message (stop_reason=end_turn), then sat idle for 5-20+ minutes
-    before emitting the ResultMessage, so finished replies reached Telegram
-    many minutes late (and on 2026-10-14 not at all, at the 1800s cap).
+    Live incident 2026-10-17/19: in resumed sessions the CLI streamed the final
+    reply, then sat idle for 5-20+ minutes before emitting the ResultMessage.
+    The live stream never sets AssistantMessage.stop_reason (it is None); the
+    turn end is the raw ``message_delta`` stream event with stop_reason=end_turn.
     """
 
     @pytest.fixture
@@ -2296,29 +2296,41 @@ class TestEndTurnGrace:
         return ClaudeSDKManager(config)
 
     @staticmethod
-    def _end_turn(text):
+    def _text(text):
+        # Live stream shape: stop_reason is None on streamed assistant messages.
         return AssistantMessage(
-            content=[TextBlock(text=text)],
-            model="claude-sonnet-4-20250514",
-            stop_reason="end_turn",
+            content=[TextBlock(text=text)], model="claude-sonnet-4-20250514"
         )
 
-    async def test_turn_end_without_result_completes_after_grace(self, sdk_manager):
-        narration = AssistantMessage(
-            content=[TextBlock(text="Checking the thread first.")],
-            model="claude-sonnet-4-20250514",
+    @staticmethod
+    def _event(event, parent=None):
+        return StreamEvent(
+            uuid="u", session_id="s", event=event, parent_tool_use_id=parent
         )
-        client = TestStreamStallDetection._client_that_hangs_after(
-            narration, self._end_turn("Final answer.")
+
+    @classmethod
+    def _delta(cls, stop_reason, parent=None):
+        return cls._event(
+            {"type": "message_delta", "delta": {"stop_reason": stop_reason}}, parent
         )
+
+    async def _run(self, sdk_manager, client):
         with patch("src.claude.sdk_integration.ClaudeSDKClient", return_value=client):
             loop = asyncio.get_event_loop()
             started = loop.time()
             response = await sdk_manager.execute_command(
                 prompt="Test prompt", working_directory=Path("/test")
             )
-            elapsed = loop.time() - started
+            return response, loop.time() - started
 
+    async def test_turn_end_without_result_completes_after_grace(self, sdk_manager):
+        client = TestStreamStallDetection._client_that_hangs_after(
+            self._text("Checking the thread first."),
+            self._text("Final answer."),
+            self._delta("end_turn"),
+            self._event({"type": "message_stop"}),
+        )
+        response, elapsed = await self._run(sdk_manager, client)
         assert elapsed < 2.5, f"should complete near the 1s grace, took {elapsed:.2f}s"
         assert response.content == "Final answer."
         assert response.is_error is False
@@ -2326,15 +2338,14 @@ class TestEndTurnGrace:
 
     async def test_result_after_end_turn_used_normally(self, sdk_manager):
         client = _mock_client(
-            self._end_turn("Final answer."), _make_result_message(result="From result")
+            self._text("Final answer."),
+            self._delta("end_turn"),
+            _make_result_message(result="From result"),
         )
-        with patch("src.claude.sdk_integration.ClaudeSDKClient", return_value=client):
-            response = await sdk_manager.execute_command(
-                prompt="Test prompt", working_directory=Path("/test")
-            )
+        response, _ = await self._run(sdk_manager, client)
         assert response.content == "From result"
 
-    async def test_pending_tool_use_does_not_start_grace(self, sdk_manager):
+    async def test_tool_use_stop_does_not_start_grace(self, sdk_manager):
         from src.claude.exceptions import ClaudeStreamStalledError
 
         tool_turn = AssistantMessage(
@@ -2342,11 +2353,18 @@ class TestEndTurnGrace:
                 ToolUseBlock(id="toolu_1", name="mcp__notion__notion-search", input={})
             ],
             model="claude-sonnet-4-20250514",
-            stop_reason="tool_use",
         )
-        client = TestStreamStallDetection._client_that_hangs_after(tool_turn)
-        with patch("src.claude.sdk_integration.ClaudeSDKClient", return_value=client):
-            with pytest.raises(ClaudeStreamStalledError):
-                await sdk_manager.execute_command(
-                    prompt="Test prompt", working_directory=Path("/test")
-                )
+        client = TestStreamStallDetection._client_that_hangs_after(
+            tool_turn, self._delta("tool_use")
+        )
+        with pytest.raises(ClaudeStreamStalledError):
+            await self._run(sdk_manager, client)
+
+    async def test_subagent_end_turn_does_not_start_grace(self, sdk_manager):
+        from src.claude.exceptions import ClaudeStreamStalledError
+
+        client = TestStreamStallDetection._client_that_hangs_after(
+            self._text("Delegating."), self._delta("end_turn", parent="toolu_task")
+        )
+        with pytest.raises(ClaudeStreamStalledError):
+            await self._run(sdk_manager, client)

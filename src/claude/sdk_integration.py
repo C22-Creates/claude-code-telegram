@@ -306,11 +306,29 @@ GUARDED_TOOLS = FILE_TOOLS | BASH_TOOLS
 _FILE_PATH_KEYS = ("file_path", "path", "notebook_path")
 
 
-def _ends_turn(message: AssistantMessage) -> bool:
-    """True when the model finished its turn with no tool call left to run."""
-    if getattr(message, "stop_reason", None) != "end_turn":
+def _turn_signal(message: Any) -> Optional[bool]:
+    """Whether *message* shows the main agent's turn ending (True) or continuing
+    (False); None when it says nothing about the turn.
+
+    The live stream never sets AssistantMessage.stop_reason, so the end of a turn
+    is the raw ``message_delta`` stream event (partial messages enabled) with
+    stop_reason ``end_turn``. Subagent events (parent_tool_use_id set) are
+    ignored — a subagent finishing is not the main turn finishing.
+    """
+    if isinstance(message, StreamEvent):
+        if message.parent_tool_use_id is not None:
+            return None
+        event = message.event or {}
+        if event.get("type") == "message_start":
+            return False
+        if event.get("type") == "message_delta":
+            return (event.get("delta") or {}).get("stop_reason") == "end_turn"
+        return None
+    if isinstance(message, AssistantMessage) and any(
+        isinstance(b, ToolUseBlock) for b in (message.content or [])
+    ):
         return False
-    return not any(isinstance(b, ToolUseBlock) for b in (message.content or []))
+    return None
 
 
 def _make_can_use_tool_callback(
@@ -882,8 +900,9 @@ class ClaudeSDKManager:
 
                         if isinstance(message, ResultMessage):
                             break
-                        if isinstance(message, AssistantMessage):
-                            turn_ended = _ends_turn(message)
+                        signal = _turn_signal(message)
+                        if signal is not None:
+                            turn_ended = signal
 
                         # Handle streaming callback
                         if stream_callback:
