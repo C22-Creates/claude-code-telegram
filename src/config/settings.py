@@ -17,6 +17,7 @@ from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from src.utils.constants import (
+    DEFAULT_CLAUDE_END_TURN_GRACE_SECONDS,
     DEFAULT_CLAUDE_MAX_COST_PER_REQUEST,
     DEFAULT_CLAUDE_MAX_COST_PER_USER,
     DEFAULT_CLAUDE_MAX_TURNS,
@@ -120,6 +121,15 @@ class Settings(BaseSettings):
             "stream as stalled — catches a single hung step (most often an "
             "outbound MCP tool call) without spending the whole "
             "claude_timeout_seconds budget on it. Must be < claude_timeout_seconds."
+        ),
+    )
+    claude_end_turn_grace_seconds: int = Field(
+        DEFAULT_CLAUDE_END_TURN_GRACE_SECONDS,
+        gt=0,
+        description=(
+            "Seconds to wait for the CLI's result after the model ends its turn "
+            "with no tool call pending, before completing the run with the "
+            "final assistant text and shutting the CLI down."
         ),
     )
     claude_max_cost_per_user: float = Field(

@@ -306,6 +306,13 @@ GUARDED_TOOLS = FILE_TOOLS | BASH_TOOLS
 _FILE_PATH_KEYS = ("file_path", "path", "notebook_path")
 
 
+def _ends_turn(message: AssistantMessage) -> bool:
+    """True when the model finished its turn with no tool call left to run."""
+    if getattr(message, "stop_reason", None) != "end_turn":
+        return False
+    return not any(isinstance(b, ToolUseBlock) for b in (message.content or []))
+
+
 def _make_can_use_tool_callback(
     security_validator: SecurityValidator,
     working_directory: Path,
@@ -796,6 +803,8 @@ class ClaudeSDKManager:
 
             # Collect messages via ClaudeSDKClient
             messages: List[Message] = []
+            end_turn_grace = self.config.claude_end_turn_grace_seconds
+            completed_without_result = {"value": False}
             interrupted = False
             # Holds the live client so the cleanup path can reach its child
             # process if cancellation fails to settle. Rebound per attempt.
@@ -838,7 +847,28 @@ class ClaudeSDKManager:
                     else:
                         await client.query(prompt)
 
-                    async for raw_data in client._query.receive_messages():
+                    stream = client._query.receive_messages().__aiter__()
+                    turn_ended = False
+                    while True:
+                        try:
+                            if turn_ended:
+                                # The model is done; give the CLI a short grace
+                                # period to send its ResultMessage instead of
+                                # holding the finished reply until it does.
+                                raw_data = await asyncio.wait_for(
+                                    stream.__anext__(), timeout=end_turn_grace
+                                )
+                            else:
+                                raw_data = await stream.__anext__()
+                        except StopAsyncIteration:
+                            break
+                        except asyncio.TimeoutError:
+                            completed_without_result["value"] = True
+                            logger.warning(
+                                "Turn ended but no result message; completing run",
+                                grace_seconds=end_turn_grace,
+                            )
+                            break
                         try:
                             message = parse_message(raw_data)
                         except MessageParseError as e:
@@ -852,6 +882,8 @@ class ClaudeSDKManager:
 
                         if isinstance(message, ResultMessage):
                             break
+                        if isinstance(message, AssistantMessage):
+                            turn_ended = _ends_turn(message)
 
                         # Handle streaming callback
                         if stream_callback:
@@ -879,6 +911,7 @@ class ClaudeSDKManager:
                 # _run_client() closes over `messages` by reference (late-binding
                 # closure), so clearing it here is seen by every new call.
                 messages.clear()
+                completed_without_result["value"] = False
                 stalled_tool_name: Optional[str] = None
 
                 if attempt > 0:
@@ -1094,6 +1127,18 @@ class ClaudeSDKManager:
             # Use ResultMessage.result if available, fall back to message extraction
             if result_content is not None:
                 content = str(result_content).strip()
+            elif completed_without_result["value"]:
+                # Grace-completed: the reply is the final assistant message,
+                # not every narration line from earlier in the turn.
+                final = next(
+                    (m for m in reversed(messages) if isinstance(m, AssistantMessage)),
+                    None,
+                )
+                content = "\n".join(
+                    b.text
+                    for b in (final.content if final else [])
+                    if hasattr(b, "text")
+                ).strip()
             else:
                 content_parts = []
                 for msg in messages:

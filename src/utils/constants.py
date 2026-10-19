@@ -11,6 +11,11 @@ DEFAULT_CLAUDE_TIMEOUT_SECONDS = 300
 # call, e.g. a Notion write that never returns) well under the full session
 # budget above, instead of silently spending all of it. See failure mode #39.
 DEFAULT_CLAUDE_TOOL_IDLE_TIMEOUT_SECONDS = 120
+# After the model ends its turn (stop_reason=end_turn, no tool call pending),
+# seconds to wait for the CLI's ResultMessage before completing the run anyway.
+# Resumed sessions were seen idling 5-20+ minutes between the final assistant
+# message and the result (2026-10-17), holding finished replies hostage.
+DEFAULT_CLAUDE_END_TURN_GRACE_SECONDS = 15
 DEFAULT_CLAUDE_MAX_TURNS = 10
 DEFAULT_CLAUDE_MAX_COST_PER_USER = 10.0
 DEFAULT_CLAUDE_MAX_COST_PER_REQUEST = 5.0
