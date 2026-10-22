@@ -117,7 +117,8 @@ class TopicWorker:
         self.flow_done: asyncio.Event | None = None  # set while a flow is live
         self.run: Any = None  # the AgentRun while run() is executing
         self.cancel_requested = False
-        self.reset_requested = False  # /new landed while the flow was live
+        self.reset_requested = False  # /new landed before the run started
+        self.run_started = False  # the flow's run was published (may have returned)
         self.discard_session = False
 
 
@@ -192,18 +193,25 @@ class TopicRouter:
     async def new_session(self, topic_key: str) -> None:
         """``/new``: forget the stored session; the next run starts fresh.
 
-        A live run is stopped and its session is not re-saved, otherwise it
-        would silently undo the reset when it finishes. A flow that is still
+        Once a flow's run has started (live, or returned but not yet saved)
+        its session is not saved, otherwise it would silently undo the reset;
+        a live run is also stopped. A flow that is still
         queued or setting up (its run not yet published) is flagged so it
         starts fresh (``resume=None``, no carry-over) even if it already read
         the old row.
         """
         worker = self._workers.get(topic_key)
         if worker is not None and worker.flow_done is not None:
-            worker.reset_requested = True
-            if worker.run is not None:
+            if worker.run_started:
+                # Running or already returned: its session predates /new.
                 worker.discard_session = True
-                await worker.run.interrupt(NEW_SESSION)
+                if worker.run is not None:
+                    await worker.run.interrupt(NEW_SESSION)
+            else:
+                worker.reset_requested = True
+        # Flags first, then clear: if a flagged flow's fresh session were saved
+        # before the clear lands, it is wiped (next run merely starts fresh);
+        # the pre-/new session can never survive.
         await self._store.clear(topic_key)
 
     async def cancel(self, topic_key: str) -> bool:
@@ -347,6 +355,7 @@ class TopicRouter:
                 return None
             # No await between publishing the run and run() entry, so /cancel
             # and inject() always see an active run once it is visible.
+            worker.run_started = True
             worker.run = run
             return await run.run(prompt)
         except Exception as exc:  # noqa: BLE001 - AgentRun.run should not raise
@@ -375,6 +384,7 @@ class TopicRouter:
         worker.run = None
         worker.cancel_requested = False
         worker.reset_requested = False
+        worker.run_started = False
         worker.discard_session = False
         if done is not None:
             done.set()

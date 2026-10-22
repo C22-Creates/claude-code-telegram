@@ -718,3 +718,55 @@ async def test_cancel_after_run_returned_is_noop(tmp_path, settings, store):
     assert await w.router.cancel("t") is False
     run.gate.set()
     await task
+
+
+class BlockingFinishStatus:
+    """Status double whose finish() blocks until released."""
+
+    def __init__(self):
+        self.in_finish = asyncio.Event()
+        self.release = asyncio.Event()
+        self.results: list[RunResult] = []
+
+    async def open(self, text_):
+        return 1
+
+    async def update(self, ev):
+        pass
+
+    async def note(self, text_):
+        pass
+
+    async def finish(self, result_):
+        self.results.append(result_)
+        self.in_finish.set()
+        await self.release.wait()
+
+
+async def test_new_after_run_returned_before_save_sticks(tmp_path, settings, store):
+    """/new while status.finish is in flight (run returned, save pending)."""
+    first, second = FakeRun(session="pre-new"), FakeRun(session="post-new")
+    first.gate.set()
+    second.gate.set()
+    statuses = [BlockingFinishStatus(), BlockingFinishStatus()]
+    statuses[1].release.set()
+    w = World(
+        tmp_path,
+        settings,
+        store,
+        run_factory=fake_runs([first, second]),
+        status_factory=lambda inbound: statuses.pop(0),
+    )
+    blocked = statuses[0]
+    await store.save("t", "old", w.cwd("t"))
+    task = asyncio.create_task(w.router.handle(msg()))
+    await blocked.in_finish.wait()
+    assert first.options.resume == "old"
+    await w.router.new_session("t")
+    blocked.release.set()
+    await task
+    assert await store.get("t") is None  # neither "old" nor "pre-new" survives
+
+    await w.router.handle(msg(text_="next"))
+    assert second.options.resume is None
+    assert (await store.get("t")).session_id == "post-new"
