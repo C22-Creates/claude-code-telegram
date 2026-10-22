@@ -13,7 +13,7 @@ propagate the caller's own cancellation). Three tasks cooperate:
 
 import asyncio
 import time
-from typing import Any, AsyncIterator, Awaitable, Callable
+from typing import Any, Awaitable, Callable
 
 import structlog
 from claude_agent_sdk import (
@@ -28,6 +28,7 @@ from claude_agent_sdk import (
 from claude_agent_sdk.types import StreamEvent
 
 from src.config.settings import Settings
+from src.harness.run_support import Prompt, as_query, bounded, first_line, join_parts
 from src.harness.sdk_lifecycle import (
     CANCELLED_TASK_CLEANUP_TIMEOUT,
     await_cancelled,
@@ -39,60 +40,18 @@ from src.harness.types import Outcome, ProgressEvent, RunResult
 
 logger = structlog.get_logger()
 
-Prompt = str | list[dict[str, Any]]
-
 INTERRUPT_TIMEOUT = 10.0  # the spike measured ~0.05s; 10s means wedged
+PROGRESS_TIMEOUT = 10.0  # a hung Telegram call must not freeze the run
 UNAVAILABLE_MCP_STATUSES = ("failed", "needs-auth")
-
-
-def _first_line(text: str | None) -> str:
-    for line in (text or "").splitlines():
-        if line.strip():
-            return line.strip()
-    return ""
-
-
-def _as_query(prompt: Prompt) -> Any:
-    """A plain string as-is; content blocks as a one-message async iterable."""
-    if isinstance(prompt, str):
-        return prompt
-    message = {"type": "user", "message": {"role": "user", "content": prompt}}
-
-    async def _one() -> AsyncIterator[dict[str, Any]]:
-        yield message
-
-    return _one()
-
-
-async def _bounded(aw: Awaitable[Any], timeout: float, what: str) -> bool:
-    """Await *aw* for at most *timeout*s; True if it finished (even by raising).
-
-    Unlike ``wait_for`` this never waits for a cancellation to land: a call
-    blocked on a wedged child may ignore it, and this runs on teardown paths.
-    """
-    task = asyncio.ensure_future(aw)
-    try:
-        done, _ = await asyncio.wait({task}, timeout=timeout)
-    except BaseException:
-        task.cancel()
-        raise
-    if not done:
-        task.cancel()
-        logger.error("harness.bounded_call_timed_out", call=what, timeout_s=timeout)
-        return False
-    if not task.cancelled() and task.exception() is not None:
-        logger.warning(
-            "harness.bounded_call_failed", call=what, error=str(task.exception())
-        )
-    return True
 
 
 class AgentRun:
     """Runs one agent request to a ``RunResult`` and supports live steering.
 
-    ``on_progress`` receives ``ProgressEvent``s; its exceptions are logged and
-    swallowed so a Telegram hiccup never kills a run. ``clock``/``sleep`` and
-    the timeouts are injectable so tests run in milliseconds.
+    ``on_progress`` receives ``ProgressEvent``s; each call is bounded and its
+    exceptions are logged and swallowed, so a Telegram hiccup never kills or
+    freezes a run. ``clock``/``sleep`` and the timeouts are injectable so tests
+    run in milliseconds.
     """
 
     def __init__(
@@ -107,6 +66,7 @@ class AgentRun:
         tick_seconds: float = 1.0,
         interrupt_timeout: float = INTERRUPT_TIMEOUT,
         cleanup_timeout: float = CANCELLED_TASK_CLEANUP_TIMEOUT,
+        progress_timeout: float = PROGRESS_TIMEOUT,
     ) -> None:
         self._options = options
         self._on_progress = on_progress
@@ -117,9 +77,9 @@ class AgentRun:
         self._tick = tick_seconds
         self._interrupt_timeout = interrupt_timeout
         self._cleanup_timeout = cleanup_timeout
+        self._progress_timeout = progress_timeout
         self.session_id: str | None = None
         self._active = False
-        self._client: Any = None
         self._reset_run()
 
     # ------------------------------------------------------------ public API
@@ -135,12 +95,15 @@ class AgentRun:
         self._active = True
         self._reset_run()
         self._started_at = self._clock()
+        self._queries_sent = 1  # the prompt; a retry's re-send is not counted
         try:
             for attempt in (1, 2):
                 self._reset_attempt()
                 await self._attempt(prompt)
                 if attempt == 1 and self._should_retry():
                     logger.warning("harness.retry", error=str(self._error))
+                    # Nothing was read: re-send what the dead client swallowed.
+                    self._buffered[:0] = self._attempt_injections
                     continue
                 break
         except asyncio.CancelledError:
@@ -148,13 +111,13 @@ class AgentRun:
             raise
         except Exception as exc:  # noqa: BLE001 - run() must not raise
             logger.exception("harness.internal_error")
-            self._finish(Outcome.ERROR, _first_line(str(exc)) or type(exc).__name__)
+            self._finish(Outcome.ERROR, first_line(str(exc)) or type(exc).__name__)
         finally:
             self._active = False
             self._client = None
         result = RunResult(
             outcome=self._outcome or Outcome.ERROR,
-            text="\n\n".join(self._texts).strip(),
+            text=self._result_text(),
             elapsed_s=self._elapsed(),
             reason=self._reason,
             session_id=self.session_id,
@@ -166,19 +129,32 @@ class AgentRun:
     async def inject(self, content: Prompt) -> None:
         """Send a follow-up into the live run (consumed at the next model call).
 
-        Raises RuntimeError when no run is accepting input; the caller decides
-        what to do with the message then.
+        Before the initial prompt is written the follow-up is buffered and sent
+        right after it. Raises RuntimeError when the run cannot take it (idle,
+        stopping, or finished before the write landed) so the caller can
+        re-queue the message instead of losing it.
         """
-        client = self._client
-        if not self._active or client is None or self._stop_reason is not None:
+        if not self._active or self._stop_reason is not None:
             raise RuntimeError("no active run to inject into")
         if self._finished.is_set():
             raise RuntimeError("run already finished")
-        await client.query(_as_query(content))
-        # Counted only after the write: a message_start observed from here on
-        # is the model reading the injection.
+        # Counted before the write: a ResultMessage read while the write is in
+        # flight must not complete the run under this injection.
         self._pending_injections += 1
         self._queries_sent += 1
+        client = self._client
+        if client is None:  # still connecting; _open() flushes the buffer
+            self._buffered.append(content)
+            return
+        try:
+            await client.query(as_query(content))
+        except BaseException:
+            self._pending_injections = max(0, self._pending_injections - 1)
+            self._queries_sent -= 1
+            raise
+        self._attempt_injections.append(content)
+        if self._finished.is_set():
+            raise RuntimeError("run finished before the injection was read")
 
     async def interrupt(self, reason: str) -> None:
         """Ask the run to stop with *reason* (outcome STOPPED). Non-blocking.
@@ -202,10 +178,13 @@ class AgentRun:
     # ------------------------------------------------------------- lifecycle
 
     def _reset_run(self) -> None:
+        self._client: Any = None
         self._started_at = self._last_event_at = 0.0
-        self._texts: list[str] = []
+        self._answers: list[str] = []  # one per completed turn
+        self._turn_text: list[str] = []  # main-agent text of the current call
         self._tool_calls = self._turn = self._queries_sent = 0
         self._pending_injections = 0
+        self._buffered: list[Prompt] = []
         self._last_tool: str | None = None
         self._paused = False
         self._stop_reason: str | None = None
@@ -218,8 +197,10 @@ class AgentRun:
         self._finished = asyncio.Event()
         self._outcome, self._reason = None, ""
         self._error: BaseException | None = None
+        self._attempt_injections: list[Prompt] = []
         self._events_seen = 0
         self._turn_ended = False
+        self._interrupt_sent = False
         self._wedged = False
 
     def _should_retry(self) -> bool:
@@ -236,70 +217,107 @@ class AgentRun:
             self._finished.set()
 
     def _fail(self, exc: BaseException) -> None:
+        """An SDK/CLI failure -> ERROR, unless the harness was already stopping."""
         logger.error("harness.sdk_error", error=str(exc), error_type=type(exc).__name__)
+        if self._stop_reason is not None:
+            self._finish(Outcome.STOPPED, self._stop_reason)
+            return
         self._error = exc
-        self._finish(Outcome.ERROR, _first_line(str(exc)) or type(exc).__name__)
+        self._finish(Outcome.ERROR, first_line(str(exc)) or type(exc).__name__)
 
     async def _attempt(self, prompt: Prompt) -> None:
         client = reader = supervisor = None
         try:
-            try:
-                client = self._client = self._client_factory(self._options)
-                await asyncio.wait_for(
-                    self._open(client, prompt), self._settings.harness_stall_seconds
-                )
-            except asyncio.TimeoutError:
-                self._fail(TimeoutError("agent did not start in time"))
-                return
-            except Exception as exc:  # noqa: BLE001
-                self._fail(exc)
+            client = self._client_factory(self._options)
+            if not await self._start(client, prompt):
                 return
             self._last_event_at = self._clock()
             reader = asyncio.create_task(self._read(client))
             supervisor = asyncio.create_task(self._supervise())
-            await self._wait_any(self._finished, self._stop_requested)
-            if not self._finished.is_set():
+            # Also wake if the reader or supervisor dies without finishing:
+            # a silently dead supervisor would mean no stall/cap protection.
+            waiters = [
+                asyncio.ensure_future(self._stop_requested.wait()),
+                asyncio.ensure_future(self._finished.wait()),
+            ]
+            try:
+                await asyncio.wait(
+                    [*waiters, reader, supervisor], return_when=asyncio.FIRST_COMPLETED
+                )
+            finally:
+                for waiter in waiters:
+                    waiter.cancel()
+            if not self._finished.is_set() and self._stop_reason is not None:
                 await self._interrupt_client(client)
+            self._finish(Outcome.ERROR, "agent run ended unexpectedly")
+        except Exception as exc:  # noqa: BLE001 - e.g. client_factory failed
+            self._fail(exc)
         finally:
+            self._client = None
             await self._teardown(client, reader, supervisor)
+
+    async def _start(self, client: Any, prompt: Prompt) -> bool:
+        """Connect and send the prompt, racing a stop request and a timeout."""
+        opener = asyncio.ensure_future(self._open(client, prompt))
+        stop = asyncio.ensure_future(self._stop_requested.wait())
+        try:
+            await asyncio.wait(
+                [opener, stop],
+                timeout=self._settings.harness_stall_seconds,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        except BaseException:  # caller cancelled: do not leave the opener running
+            opener.cancel()
+            raise
+        finally:
+            stop.cancel()
+        if opener.done():
+            if opener.exception() is None:
+                return True
+            self._fail(opener.exception())
+            return False
+        opener.cancel()
+        if not await await_cancelled(opener, "connect", self._cleanup_timeout):
+            self._wedged = True
+        if self._stop_reason is not None:
+            self._finish(Outcome.STOPPED, self._stop_reason)
+        else:
+            self._fail(TimeoutError("agent did not start in time"))
+        return False
 
     async def _open(self, client: Any, prompt: Prompt) -> None:
         await client.connect()
-        await client.query(_as_query(prompt))
-        self._queries_sent += 1
+        await client.query(as_query(prompt))
+        # Injections that arrived while connecting go out right after the
+        # prompt, in order; only then is the client exposed to inject().
+        while self._buffered:
+            content = self._buffered[0]  # popped only once written (retry-safe)
+            await client.query(as_query(content))
+            self._attempt_injections.append(self._buffered.pop(0))
+        self._client = client
 
     async def _interrupt_client(self, client: Any) -> None:
         reason = self._stop_reason or "stopped"
-        if await _bounded(client.interrupt(), self._interrupt_timeout, "interrupt"):
+        self._interrupt_sent = True
+        if await bounded(client.interrupt(), self._interrupt_timeout, "interrupt"):
             # Let the reader see the post-interrupt ResultMessage (session id).
-            await _bounded(self._finished.wait(), self._interrupt_timeout, "settle")
+            await bounded(self._finished.wait(), self._interrupt_timeout, "settle")
         else:
             self._wedged = True
         self._finish(Outcome.STOPPED, reason)
 
     async def _teardown(self, client: Any, reader: Any, supervisor: Any) -> None:
         reason = self._stop_reason or "run_end"
+        settled = True
         for task in (supervisor, reader):
             if task is not None and not task.done():
                 task.cancel()
-        settled = True
-        if supervisor is not None:
-            await await_cancelled(supervisor, reason, self._cleanup_timeout)
-        if reader is not None:
-            settled = await await_cancelled(reader, reason, self._cleanup_timeout)
+                ok = await await_cancelled(task, reason, self._cleanup_timeout)
+                settled = settled and (ok or task is supervisor)
         if client is not None:
             if self._wedged or not settled:
                 reap_wedged_child(client, reason)
-            await _bounded(client.disconnect(), self._cleanup_timeout, "disconnect")
-
-    @staticmethod
-    async def _wait_any(*events: asyncio.Event) -> None:
-        waiters = [asyncio.ensure_future(e.wait()) for e in events]
-        try:
-            await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
-        finally:
-            for w in waiters:
-                w.cancel()
+            await bounded(client.disconnect(), self._cleanup_timeout, "disconnect")
 
     # ---------------------------------------------------------------- reader
 
@@ -309,13 +327,10 @@ class AgentRun:
                 await self._on_message(message)
                 if self._finished.is_set():
                     return
-        except Exception as exc:  # noqa: BLE001 - becomes Outcome.ERROR
+        except Exception as exc:  # noqa: BLE001 - becomes ERROR (or STOPPED)
             self._fail(exc)
             return
-        if self._stop_reason is not None:
-            self._finish(Outcome.STOPPED, self._stop_reason)
-        else:
-            self._fail(RuntimeError("agent stream closed without a result"))
+        self._fail(RuntimeError("agent stream closed without a result"))
 
     async def _on_message(self, message: Any) -> None:
         now = self._clock()
@@ -339,6 +354,7 @@ class AgentRun:
             (event.event or {}).get("type") == "message_start"
         ):
             self._turn += 1
+            self._turn_text = []  # earlier calls' text was narration
             self._pending_injections = 0  # the model is reading everything sent
             await self._emit("turn")
 
@@ -350,7 +366,7 @@ class AgentRun:
                 self._last_tool = block.name
                 await self._emit("tool", tool=block.name)
             elif isinstance(block, TextBlock) and main and block.text.strip():
-                self._texts.append(block.text.strip())
+                self._turn_text.append(block.text)
                 await self._emit("text", detail=block.text)
 
     async def _on_init(self, message: SystemMessage) -> None:
@@ -362,20 +378,41 @@ class AgentRun:
 
     def _on_result(self, message: ResultMessage) -> None:
         self.session_id = message.session_id or self.session_id
-        if self._stop_reason is not None:
-            self._finish(Outcome.STOPPED, self._stop_reason)
+        if not message.is_error:
+            self._close_answer(message.result)
+        if self._interrupt_sent:
+            self._finish(Outcome.STOPPED, self._stop_reason or "stopped")
         elif message.is_error and message.subtype == "error_max_turns":
             self._finish(Outcome.STOPPED, "hit max turns")
         elif message.is_error:
-            reason = _first_line(message.result) or message.subtype
-            self._finish(Outcome.ERROR, reason)
+            self._finish(Outcome.ERROR, first_line(message.result) or message.subtype)
         elif self._pending_injections == 0:
             self._finish(Outcome.DONE)
         # else: an injection is unread; its turn's ResultMessage ends the run.
 
+    def _close_answer(self, result_text: str | None) -> None:
+        """Record a finished turn's answer: the CLI's result, else the last call."""
+        answer = (result_text or "").strip() or join_parts(self._turn_text)
+        if answer:
+            self._answers.append(answer)
+        self._turn_text = []
+
+    def _result_text(self) -> str:
+        """Answers of completed turns, plus the unfinished call's partial text."""
+        if self._outcome is Outcome.DONE:
+            return join_parts(self._answers)
+        return join_parts([*self._answers, join_parts(self._turn_text)])
+
     # ------------------------------------------------------------ supervisor
 
     async def _supervise(self) -> None:
+        try:
+            await self._supervise_loop()
+        except Exception as exc:  # noqa: BLE001 - never lose the watchdog quietly
+            logger.exception("harness.supervisor_failed")
+            self._fail(exc)
+
+    async def _supervise_loop(self) -> None:
         s = self._settings
         marks = sorted(m * 60 for m in s.harness_heartbeat_minutes)
         cap = s.harness_run_cap_seconds
@@ -395,6 +432,7 @@ class AgentRun:
                 and idle >= s.harness_end_turn_grace_seconds
             ):
                 logger.warning("harness.end_turn_without_result", idle_s=idle)
+                self._close_answer(None)
                 self._finish(Outcome.DONE)
 
     # --------------------------------------------------------------- helpers
@@ -410,12 +448,9 @@ class AgentRun:
             elapsed_s=self._elapsed(),
             detail=detail,
         )
-        try:
-            await self._on_progress(event)
-        except Exception as exc:  # noqa: BLE001 - progress is best-effort
-            logger.warning(
-                "harness.progress_callback_failed", kind=kind, error=str(exc)
-            )
+        await bounded(
+            self._on_progress(event), self._progress_timeout, f"on_progress:{kind}"
+        )
 
     def _log_event(self, message: Any, now: float) -> None:
         tool = None

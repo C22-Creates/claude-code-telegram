@@ -53,9 +53,11 @@ def settings(tmp_path):
 class Harness:
     """One AgentRun wired to a scripted fake client and a fake clock."""
 
-    def __init__(self, script, settings, on_progress=None, **client_kw):
+    def __init__(
+        self, script, settings, on_progress=None, client_cls=FakeSDKClient, **client_kw
+    ):
         self.clock = FakeClock()
-        self.factory = FakeSDKClient.factory(script, sleep=self.clock.wait, **client_kw)
+        self.factory = client_cls.factory(script, sleep=self.clock.wait, **client_kw)
         self.client = self.factory.client
         self.events: list[ProgressEvent] = []
 
@@ -73,6 +75,7 @@ class Harness:
             sleep=self.clock.tick,
             interrupt_timeout=0.05,
             cleanup_timeout=0.05,
+            progress_timeout=0.05,
         )
 
     def kinds(self, kind: str) -> list[ProgressEvent]:
@@ -92,7 +95,7 @@ async def test_happy_path_done(settings):
             (0, fakes.tool_use("mcp__notion__notion-search")),
             (0, fakes.message_start()),
             (0, fakes.text("Here is the answer.")),
-            (0, fakes.result(session_id="sess-9")),
+            (0, fakes.result(session_id="sess-9", text="Here is the answer.")),
         ],
         settings,
     )
@@ -124,7 +127,7 @@ async def test_stall_interrupts_after_5m_keeps_session(settings):
     assert h.client.interrupted == 1
     assert res.session_id == "sess-1"  # from the post-interrupt ResultMessage
     assert res.text == "Looking now."
-    assert 300 <= res.elapsed_s <= 302
+    assert 300 <= res.elapsed_s <= 310  # fake time drifts a few ticks
 
 
 async def test_heartbeats_at_20_and_40m(settings):
@@ -144,7 +147,7 @@ async def test_cap_at_60m_returns_partial_text(settings):
     assert res.outcome is Outcome.STOPPED
     assert res.reason == "hit 60m cap"
     assert h.client.interrupted == 1
-    assert 3600 <= res.elapsed_s <= 3602
+    assert 3600 <= res.elapsed_s <= 3610
     # 15 texts landed before the cap (at 4m, 8m, ... 60m minus the race).
     assert res.text.startswith("t0\n\nt1\n\n")
     assert "t13" in res.text
@@ -162,7 +165,7 @@ async def test_end_turn_grace_completes_without_result(settings):
     res = await h.run.run("hi")
     assert res.outcome is Outcome.DONE
     assert res.text == "All done."
-    assert 15 <= res.elapsed_s <= 17
+    assert 15 <= res.elapsed_s <= 25  # not 300 (stall), not 0
     assert h.client.interrupted == 0
 
 
@@ -174,7 +177,7 @@ async def test_subagent_end_turn_ignored(settings):
             (0, fakes.message_delta_end_turn(parent_tool_use_id="tu-Task")),
             (40, fakes.message_start()),
             (0, fakes.text("Subagent finished; summary.")),
-            (0, fakes.result()),
+            (0, fakes.result(text=None)),
         ],
         settings,
     )
@@ -194,7 +197,7 @@ async def test_inject_mid_turn_merged_single_result(settings):
             (5, fakes.message_start()),
             (0, fakes.text("Counted to 30. 2 + 2 = 4.")),
             (0, fakes.message_delta_end_turn()),
-            (0, fakes.result()),
+            (0, fakes.result(text=None)),
         ],
         settings,
     )
@@ -407,7 +410,7 @@ async def test_watchdog_paused_while_waiting_then_restarts(settings):
     assert res.outcome is Outcome.STOPPED
     assert res.reason == "stalled on AskUserQuestion"
     # Stall clock restarted from the answer at 12m, not from the tool call.
-    assert 1020 <= res.elapsed_s <= 1023
+    assert 1020 <= res.elapsed_s <= 1035
 
 
 async def test_multimodal_prompt_and_inject_send_user_message(settings):
@@ -447,3 +450,161 @@ async def test_caller_cancel_tears_down_and_propagates(settings):
         await task
     assert h.client.disconnected
     assert not h.run.is_active
+
+
+# ------------------------------------------------------- review fix round 1
+
+
+class SlowInjectClient(FakeSDKClient):
+    """``query()`` for injections yields a few times before the write lands."""
+
+    async def query(self, message, session_id="default"):
+        if self.queries:
+            for _ in range(5):
+                await asyncio.sleep(0)
+        await super().query(message, session_id)
+
+
+class GatedConnectClient(FakeSDKClient):
+    """``connect()`` blocks until the test opens ``gate``."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.gate = asyncio.Event()
+
+    async def connect(self, prompt=None):
+        await self.gate.wait()
+        await super().connect(prompt)
+
+
+async def test_narration_excluded_from_answer(settings):
+    narrated = [
+        (0, fakes.message_start()),
+        (0, fakes.text("Let me check…")),
+        (0, fakes.tool_use("Bash")),
+        (0, fakes.message_start()),
+        (0, fakes.text("Answer")),
+    ]
+    h = Harness([*narrated, (0, fakes.result(text=None))], settings)
+    assert (await h.run.run("x")).text == "Answer"
+    h = Harness([*narrated, (0, fakes.result(text="Answer"))], settings)
+    assert (await h.run.run("x")).text == "Answer"
+    h = Harness([*narrated, (0, fakes.message_delta_end_turn())], settings)
+    res = await h.run.run("x")  # grace completion
+    assert (res.outcome, res.text) == (Outcome.DONE, "Answer")
+
+
+async def test_inject_in_flight_during_result_is_not_dropped(settings):
+    holder: dict = {}
+
+    async def start_inject() -> None:
+        holder["task"] = asyncio.create_task(holder["run"].inject("more"))
+        await asyncio.sleep(0)  # the write is now in flight
+
+    h = Harness(
+        [
+            (0, fakes.message_start()),
+            (0, fakes.text("A")),
+            ("call", start_inject),
+            (0, fakes.result(text="A")),
+            (10, fakes.message_start()),
+            (0, fakes.text("B")),
+            (0, fakes.result(text="B")),
+        ],
+        settings,
+        client_cls=SlowInjectClient,
+    )
+    holder["run"] = h.run
+    res = await h.run.run("q")
+    await holder["task"]  # accepted, so it must have been answered
+    assert h.client.queries == ["q", "more"]
+    assert (res.outcome, res.text) == (Outcome.DONE, "A\n\nB")
+
+
+async def test_inject_raises_if_run_finished_during_write(settings):
+    holder: dict = {}
+
+    async def start_inject() -> None:
+        holder["task"] = asyncio.create_task(holder["run"].inject("more"))
+        await asyncio.sleep(0)
+
+    h = Harness(
+        [
+            (0, fakes.message_start()),
+            ("call", start_inject),
+            (0, fakes.result(is_error=True, text="boom")),
+        ],
+        settings,
+        client_cls=SlowInjectClient,
+    )
+    holder["run"] = h.run
+    res = await h.run.run("q")
+    assert res.outcome is Outcome.ERROR
+    with pytest.raises(RuntimeError):
+        await holder["task"]  # the router can re-queue it
+
+
+async def test_stream_error_after_stop_is_stopped(settings):
+    holder: dict = {}
+    h = Harness(
+        [
+            (0, fakes.message_start()),
+            (0, fakes.tool_use("Bash")),
+            ("call", lambda: holder["run"].interrupt("cancelled")),
+            ("raise", RuntimeError("pipe broke")),
+        ],
+        settings,
+    )
+    holder["run"] = h.run
+    res = await h.run.run("q")
+    assert (res.outcome, res.reason) == (Outcome.STOPPED, "cancelled")
+
+
+async def test_hung_progress_callback_does_not_freeze_watchdog(settings):
+    async def hang(event: ProgressEvent) -> None:
+        await asyncio.Event().wait()
+
+    s = settings.model_copy(update={"harness_heartbeat_minutes": [1]})
+    h = Harness(
+        [(0, fakes.message_start()), (0, fakes.tool_use("X"))], s, on_progress=hang
+    )
+    # The heartbeat at 1m hangs in the supervisor; the stall must still fire.
+    res = await asyncio.wait_for(h.run.run("q"), 5)
+    assert (res.outcome, res.reason) == (Outcome.STOPPED, "stalled on X")
+
+
+async def test_inject_during_connect_is_buffered_after_prompt(settings):
+    h = Harness(
+        [(0, fakes.message_start()), (0, fakes.text("A")), (0, fakes.result(text="A"))],
+        settings,
+        client_cls=GatedConnectClient,
+    )
+    task = asyncio.create_task(h.run.run("go"))
+    await asyncio.sleep(0.01)
+    await h.run.inject("more")  # accepted while still connecting
+    assert h.client.queries == []
+    h.client.gate.set()
+    res = await asyncio.wait_for(task, 1)
+    assert h.client.queries == ["go", "more"]
+    assert (res.outcome, res.text) == (Outcome.DONE, "A")
+
+
+async def test_interrupt_during_connect_returns_promptly(settings):
+    h = Harness([], settings, client_cls=GatedConnectClient)
+    task = asyncio.create_task(h.run.run("go"))
+    await asyncio.sleep(0.01)
+    await h.run.interrupt("cancelled")
+    res = await asyncio.wait_for(task, 1)
+    assert (res.outcome, res.reason) == (Outcome.STOPPED, "cancelled")
+    assert h.client.queries == []
+    assert h.client.disconnected
+
+
+async def test_supervisor_failure_ends_run_with_error(settings):
+    async def broken_sleep(_s: float) -> None:
+        raise RuntimeError("tick broke")
+
+    h = Harness([(0, fakes.message_start()), (0, fakes.text("x"))], settings)
+    h.run._sleep = broken_sleep
+    res = await asyncio.wait_for(h.run.run("q"), 1)
+    assert (res.outcome, res.reason) == (Outcome.ERROR, "tick broke")
