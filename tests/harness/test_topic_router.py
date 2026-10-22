@@ -495,6 +495,7 @@ async def test_new_during_run_stops_it_and_does_not_resave(tmp_path, settings, s
     await w.router.new_session("t")
     await task
     assert await store.get("t") is None
+    assert w.edited_texts()[-1].startswith("⚠️ stopped (new session) · ")
 
 
 # ------------------------------------------------------------------- rotation
@@ -536,7 +537,9 @@ async def test_summary_exception_still_starts_fresh(tmp_path, settings, store):
 # ---------------------------------------------------------------------- crash
 
 
-async def test_run_crash_errors_and_drops_worker(tmp_path, settings, store):
+async def test_run_crash_errors_and_next_message_gets_fresh_run(
+    tmp_path, settings, store
+):
     crashing = FakeRun(run_error=ValueError("boom\nsecond line"))
     crashing.gate.set()
     healthy = FakeRun(session="fresh")
@@ -544,10 +547,174 @@ async def test_run_crash_errors_and_drops_worker(tmp_path, settings, store):
     w = World(tmp_path, settings, store, run_factory=fake_runs([crashing, healthy]))
     await w.router.handle(msg())
     assert w.edited_texts()[-1] == "❌ error: boom"
-    assert "t" not in w.router._workers
+    assert w.router.active_run("t") is None
     assert await run_rows(store) == [("t", "error")]
     assert w.slots.in_use == 0
 
     await w.router.handle(msg(text_="retry"))
     assert healthy.prompts == ["retry"]
     assert (await store.get("t")).session_id == "fresh"
+
+
+async def test_crash_while_message_steers_never_runs_two_flows(
+    tmp_path, settings, store
+):
+    """B waits on the topic lock while C (holding it) is in the bridge; the
+    flow crashes meanwhile. B and C must not both start flows."""
+    crashing = FakeRun(
+        inject_error=RuntimeError("no active run"), run_error=ValueError("boom")
+    )
+    # Later runs stay open until released, so an overlap would be visible.
+    runs = [crashing, FakeRun(session="s2"), FakeRun(session="s3")]
+    active = {"now": 0, "max": 0}
+    made: list[FakeRun] = []
+
+    def factory(options, on_progress):
+        run = runs.pop(0)
+        made.append(run)
+        run.options = options
+        original = run.run
+
+        async def counted(prompt):
+            active["now"] += 1
+            active["max"] = max(active["max"], active["now"])
+            try:
+                return await original(prompt)
+            finally:
+                active["now"] -= 1
+
+        run.run = counted
+        return run
+
+    in_bridge, release_bridge = asyncio.Event(), asyncio.Event()
+
+    class BlockingBridge(FakeBridge):
+        async def try_answer_with_text(self, topic_key, text_):
+            in_bridge.set()
+            await release_bridge.wait()
+            return False
+
+    w = World(
+        tmp_path, settings, store, run_factory=factory, ask_bridge=BlockingBridge(False)
+    )
+    a = asyncio.create_task(w.router.handle(msg()))
+    await until(lambda: crashing.prompts)
+    c = asyncio.create_task(w.router.handle(msg(text_="C", message_id=102)))
+    await in_bridge.wait()  # C holds the topic lock
+    b = asyncio.create_task(w.router.handle(msg(text_="B", message_id=101)))
+    await settle()
+    crashing.gate.set()
+    await a  # the flow crashed and closed while C and B are mid-decision
+    release_bridge.set()
+    await until(lambda: active["now"] >= 1)
+    await asyncio.sleep(0.2)  # real DB I/O: give a second flow time to appear
+    assert active["now"] == 1  # exactly one flow runs in the topic
+    while not (b.done() and c.done()):
+        for r in made:
+            r.gate.set()
+        await settle()
+    await asyncio.gather(b, c)
+    assert active["max"] == 1
+    handled = [p for r in made[1:] for p in r.prompts + r.injected]
+    assert sorted(handled) == ["B", "C"]
+    assert len(w.router._workers) == 1
+
+
+async def test_new_while_queued_starts_fresh(tmp_path, settings, store):
+    blocker = FakeRun()
+    target = FakeRun(session="fresh")
+    target.gate.set()
+    w = World(
+        tmp_path, settings, store, cap=1, run_factory=fake_runs([blocker, target])
+    )
+    await store.save("t", "old", w.cwd("t"))
+    tb = asyncio.create_task(w.router.handle(msg("other")))
+    await until(lambda: blocker.prompts)
+    t1 = asyncio.create_task(w.router.handle(msg("t")))
+    await until(lambda: QUEUED_TEXT in w.sent_texts())
+    await w.router.new_session("t")
+    blocker.gate.set()
+    await asyncio.gather(tb, t1)
+    assert target.options.resume is None
+    assert (await store.get("t")).session_id == "fresh"
+
+
+async def test_new_during_setup_after_row_read_starts_fresh(tmp_path, settings, store):
+    """/new lands while the carry-over summary runs (old row already read)."""
+    in_summary, release = asyncio.Event(), asyncio.Event()
+
+    async def slow_summary(session_id, cwd, settings):
+        in_summary.set()
+        await release.wait()
+        return "OLD CONTEXT"
+
+    run = FakeRun(session="fresh")
+    run.gate.set()
+    w = World(
+        tmp_path,
+        settings,
+        store,
+        run_factory=fake_runs([run]),
+        summarize_fn=slow_summary,
+    )
+    await store.save("t", "old", w.cwd("t"), now=time.time() - 3 * HOUR)
+    task = asyncio.create_task(w.router.handle(msg()))
+    await in_summary.wait()
+    await w.router.new_session("t")
+    release.set()
+    await task
+    assert run.options.resume is None
+    assert run.prompts == ["hello"]  # no carry-over after /new
+    assert (await store.get("t")).session_id == "fresh"
+
+
+async def test_new_during_setup_with_resumable_session(tmp_path, settings, store):
+    """/new after the (fresh) row was read for resume: no resume of the old id."""
+    in_start, release = asyncio.Event(), asyncio.Event()
+    real_start_run = store.start_run
+
+    async def slow_start_run(*args, **kwargs):
+        in_start.set()
+        await release.wait()
+        return await real_start_run(*args, **kwargs)
+
+    store.start_run = slow_start_run
+    run = FakeRun(session="fresh")
+    run.gate.set()
+    w = World(tmp_path, settings, store, run_factory=fake_runs([run]))
+    await store.save("t", "old", w.cwd("t"))
+    task = asyncio.create_task(w.router.handle(msg()))
+    await in_start.wait()
+    await w.router.new_session("t")
+    release.set()
+    await task
+    assert run.options.resume is None
+    assert (await store.get("t")).session_id == "fresh"
+
+
+@pytest.mark.parametrize("method", ["get", "start_run"])
+async def test_store_failure_finishes_with_error_and_frees_slot(
+    tmp_path, settings, store, method
+):
+    async def broken(*args, **kwargs):
+        raise OSError("database is locked")
+
+    setattr(store, method, broken)
+    run = FakeRun()
+    w = World(tmp_path, settings, store, cap=1, run_factory=fake_runs([run]))
+    await w.router.handle(msg())  # must not raise
+    assert w.edited_texts()[-1] == "❌ error: database is locked"
+    assert w.slots.in_use == 0
+    assert run.prompts == []
+    assert w.router._workers["t"].flow_done is None
+
+
+async def test_cancel_after_run_returned_is_noop(tmp_path, settings, store):
+    run = FakeRun()
+    w = World(tmp_path, settings, store, run_factory=fake_runs([run]))
+    task = asyncio.create_task(w.router.handle(msg()))
+    await until(lambda: run.prompts)
+    run.is_active = False  # returned; the flow is still finishing
+    assert await w.router.cancel("t") is False
+    run.gate.set()
+    await task

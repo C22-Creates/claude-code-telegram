@@ -117,6 +117,7 @@ class TopicWorker:
         self.flow_done: asyncio.Event | None = None  # set while a flow is live
         self.run: Any = None  # the AgentRun while run() is executing
         self.cancel_requested = False
+        self.reset_requested = False  # /new landed while the flow was live
         self.discard_session = False
 
 
@@ -174,6 +175,8 @@ class TopicRouter:
         while True:
             worker = self._workers.setdefault(key, TopicWorker())
             async with worker.lock:
+                if self._workers.get(key) is not worker:
+                    continue  # defensive: never run on a worker no longer mapped
                 if worker.flow_done is None:
                     worker.flow_done = asyncio.Event()
                     break
@@ -190,12 +193,17 @@ class TopicRouter:
         """``/new``: forget the stored session; the next run starts fresh.
 
         A live run is stopped and its session is not re-saved, otherwise it
-        would silently undo the reset when it finishes.
+        would silently undo the reset when it finishes. A flow that is still
+        queued or setting up (its run not yet published) is flagged so it
+        starts fresh (``resume=None``, no carry-over) even if it already read
+        the old row.
         """
         worker = self._workers.get(topic_key)
-        if worker is not None and worker.run is not None:
-            worker.discard_session = True
-            await worker.run.interrupt(NEW_SESSION)
+        if worker is not None and worker.flow_done is not None:
+            worker.reset_requested = True
+            if worker.run is not None:
+                worker.discard_session = True
+                await worker.run.interrupt(NEW_SESSION)
         await self._store.clear(topic_key)
 
     async def cancel(self, topic_key: str) -> bool:
@@ -204,6 +212,8 @@ class TopicRouter:
         if worker is None or worker.flow_done is None:
             return False
         if worker.run is not None:
+            if not worker.run.is_active:
+                return False  # already returned; the flow is just finishing
             await worker.run.interrupt(CANCELLED)
         else:
             worker.cancel_requested = True
@@ -253,21 +263,31 @@ class TopicRouter:
         await self._open_status(status, opening, queued)
         run_id: str | None = None
         db_status = "error"
-        crashed = False
         try:
             async with self._slots.acquire("interactive"):
                 if queued:
                     await self._note(status, opening or STARTING_TEXT)
-                result: RunResult | None = None
-                if not worker.cancel_requested:
-                    resume, summary = await self._session_for(ctx)
-                    prompt = _with_carryover(self._build_prompt(inbound), summary)
-                    run_id = await self._store.start_run(
-                        key, inbound.chat_id, inbound.thread_id, _prompt_head(prompt)
-                    )
-                    result, crashed = await self._execute(
-                        worker, ctx, inbound, resume, prompt, status
-                    )
+                started = self._clock()
+                if worker.cancel_requested:
+                    result: RunResult | None = None
+                else:
+                    try:
+                        resume, summary = await self._session_for(ctx)
+                        run_id = await self._store.start_run(
+                            key,
+                            inbound.chat_id,
+                            inbound.thread_id,
+                            _prompt_head(
+                                _with_carryover(self._build_prompt(inbound), summary)
+                            ),
+                        )
+                    except Exception as exc:  # noqa: BLE001 - store/DB failure
+                        logger.exception("harness.flow_setup_failed", topic=key)
+                        result = self._error_result(exc, started)
+                    else:
+                        result = await self._execute(
+                            worker, ctx, inbound, resume, summary, status
+                        )
                 if result is None:
                     result = RunResult(
                         outcome=Outcome.STOPPED,
@@ -277,7 +297,10 @@ class TopicRouter:
                     )
             await self._finish_status(status, result)
             if result.session_id and not worker.discard_session:
-                await self._store.save(key, result.session_id, ctx.cwd)
+                try:
+                    await self._store.save(key, result.session_id, ctx.cwd)
+                except Exception:  # noqa: BLE001 - the answer is already out
+                    logger.exception("harness.session_save_failed", topic=key)
             db_status = result.outcome.value
         except asyncio.CancelledError:
             db_status = "stopped"
@@ -285,7 +308,7 @@ class TopicRouter:
         finally:
             if run_id is not None:
                 await self._end_run(run_id, db_status)
-            self._close_flow(worker, key, crashed)
+            self._close_flow(worker)
 
     async def _execute(
         self,
@@ -293,12 +316,20 @@ class TopicRouter:
         ctx: TopicContext,
         inbound: Inbound,
         resume: str | None,
-        prompt: Prompt,
+        summary: str,
         status: Any,
-    ) -> tuple[RunResult | None, bool]:
-        """Build and run the AgentRun; (result, crashed). None if cancelled."""
+    ) -> RunResult | None:
+        """Build and run the AgentRun; None if cancelled before it started.
+
+        Everything from the reset check to ``run()`` entry is synchronous, so a
+        /new or /cancel either lands before (flags honoured here) or after the
+        run is published (handled via ``worker.run``).
+        """
         started = self._clock()
         try:
+            if worker.reset_requested:  # /new during queue/setup: start fresh
+                resume, summary = None, ""
+            prompt = _with_carryover(self._build_prompt(inbound), summary)
             ref = RunRef()
             can_use_tool: CanUseTool = (
                 self._ask_bridge.make_can_use_tool(
@@ -313,35 +344,38 @@ class TopicRouter:
             run = self._run_factory(options, status.update)
             ref.bind(run)
             if worker.cancel_requested:  # /cancel landed during setup
-                return None, False
+                return None
             # No await between publishing the run and run() entry, so /cancel
             # and inject() always see an active run once it is visible.
             worker.run = run
-            return await run.run(prompt), False
+            return await run.run(prompt)
         except Exception as exc:  # noqa: BLE001 - AgentRun.run should not raise
             logger.exception("harness.run_crashed", topic=ctx.topic_key)
-            reason = first_line(str(exc)) or type(exc).__name__
-            return (
-                RunResult(
-                    outcome=Outcome.ERROR,
-                    text="",
-                    elapsed_s=self._clock() - started,
-                    reason=reason,
-                ),
-                True,
-            )
+            return self._error_result(exc, started)
         finally:
             worker.run = None
 
-    def _close_flow(self, worker: TopicWorker, key: str, crashed: bool) -> None:
-        """Mark the topic idle and wake messages queued behind the flow."""
+    def _error_result(self, exc: BaseException, started: float) -> RunResult:
+        return RunResult(
+            outcome=Outcome.ERROR,
+            text="",
+            elapsed_s=self._clock() - started,
+            reason=first_line(str(exc)) or type(exc).__name__,
+        )
+
+    def _close_flow(self, worker: TopicWorker) -> None:
+        """Mark the topic idle and wake messages queued behind the flow.
+
+        The worker is kept even after a crash: every flow builds a fresh
+        AgentRun (hence a fresh client), and keeping one worker per topic means
+        no message can ever hold a stale, unmapped worker (two flows at once).
+        """
         done = worker.flow_done
         worker.flow_done = None
         worker.run = None
         worker.cancel_requested = False
+        worker.reset_requested = False
         worker.discard_session = False
-        if crashed and self._workers.get(key) is worker:
-            del self._workers[key]  # next message gets a fresh worker + client
         if done is not None:
             done.set()
 
