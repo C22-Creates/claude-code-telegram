@@ -43,7 +43,10 @@ from src.harness.util import fmt_elapsed, redact_proxy_url
 logger = structlog.get_logger()
 
 DM_PROJECT = "c22os"
-INBOX_ROOT = Path("data/inbox")
+INBOX_ROOT = Path("data/inbox")  # tests/standalone only; the app passes inbox_root
+# Production inbox (ruling R17): inside APPROVED_DIRECTORY, so the agent's
+# Read of "Attached file: <path>" passes the tool guard's boundary check.
+INBOX_DIRNAME = ".telegram-inbox"
 MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024  # the Bot API's getFile limit
 GENERAL_TOPIC_ID = 1  # forum "General" topic; Telegram omits its thread id
 ASK_PREFIX = "ask:"
@@ -109,7 +112,9 @@ class TelegramAdapter:
         voice: ``VoiceHandler`` (or None when voice is unavailable).
         thread_manager: ``ProjectThreadManager`` (topic → project + registry).
         resume_bridge: Hermes ``ResumeBridge``; None when the dispatcher is off.
-        inbox_root: where attachments are saved (``data/inbox`` by default).
+        inbox_root: where attachments are saved; must be inside the approved
+            directory or the agent cannot open them (the app passes
+            ``approved_directory / INBOX_DIRNAME``).
         now: wall clock for attachment timestamps.
     """
 

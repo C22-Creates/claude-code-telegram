@@ -1,7 +1,7 @@
 """Where user attachments land on disk, and how photos reach the model.
 
-Files are saved under ``data/inbox/<topic>/<timestamp>-<name>`` so the agent
-can open them by path and Carl can find them later. Names come from Telegram
+Files are saved under ``<inbox>/<topic>/<timestamp>-<name>`` (in production
+``APPROVED_DIRECTORY/.telegram-inbox``) so the agent can open them by path and Carl can find them later. Names come from Telegram
 (i.e. from whoever sent the file), so they are reduced to a safe basename
 before they touch the filesystem.
 """

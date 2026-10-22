@@ -30,7 +30,7 @@ from src.harness.ask_bridge import AskBridge
 from src.harness.jobs import ScheduledJobHandler
 from src.harness.run_slots import RunSlots
 from src.harness.session_store import SessionStore
-from src.harness.telegram_adapter import TelegramAdapter
+from src.harness.telegram_adapter import INBOX_DIRNAME, TelegramAdapter
 from src.harness.topic_router import TopicRouter
 from src.harness.voice import VoiceHandler
 from src.notifications.service import NotificationService
@@ -346,6 +346,7 @@ def _wire(
         _voice_handler(settings),
         thread_manager,
         ResumeBridge(board) if board is not None else None,
+        inbox_root=settings.approved_directory / INBOX_DIRNAME,
     )
     application = application_factory(adapter)
     bot = application.bot

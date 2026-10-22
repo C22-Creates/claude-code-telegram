@@ -447,3 +447,100 @@ def test_main_module_imports():
     import src.main  # noqa: F401
 
     assert Path(src.main.__file__).name == "main.py"
+
+
+# ------------------------------------------------- attachments (C1 / ruling R17)
+
+
+def document_update(thread_id: int, file_id: str, name: str):
+    from telegram import Update
+
+    return Update.de_json(
+        {
+            "update_id": 9001,
+            "message": {
+                "message_id": 77,
+                "date": 0,
+                "chat": {
+                    "id": GROUP,
+                    "type": "supergroup",
+                    "title": "g",
+                    "is_forum": True,
+                },
+                "from": {"id": CARL, "is_bot": False, "first_name": "C"},
+                "message_thread_id": thread_id,
+                "is_topic_message": True,
+                "caption": "summarize",
+                "document": {
+                    "file_id": file_id,
+                    "file_unique_id": "u" + file_id,
+                    "file_name": name,
+                    "mime_type": "application/pdf",
+                    "file_size": 4,
+                },
+            },
+        },
+        None,
+    )
+
+
+async def test_document_attachment_is_readable_through_the_guard(
+    env, tmp_path, monkeypatch
+):
+    """Production shape: the service cwd is NOT under APPROVED_DIRECTORY."""
+    import re
+
+    from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
+
+    service_cwd = tmp_path / "c22os-telegram"
+    service_cwd.mkdir()
+    monkeypatch.chdir(service_cwd)
+    settings = make_settings(env)
+    checks: dict = {}
+
+    def factory(options, on_progress):
+        async def read_attachment() -> None:
+            (prompt,) = client_factory.client.queries
+            path = re.search(r"Attached file: (\S+)", prompt).group(1)
+            old = (
+                service_cwd
+                / "data"
+                / "inbox"
+                / Path(path).relative_to(
+                    settings.approved_directory / ".telegram-inbox"
+                )
+            )
+            checks["path"] = Path(path)
+            checks["new"] = await options.can_use_tool(
+                "Read", {"file_path": path}, None
+            )
+            checks["old"] = await options.can_use_tool(
+                "Read", {"file_path": str(old)}, None
+            )
+
+        client_factory = FakeSDKClient.factory(
+            [(0, message_start()), ("call", read_attachment), (0, result())]
+        )
+        return AgentRun(
+            options, on_progress, settings, client_factory, cleanup_timeout=0.05
+        )
+
+    app = await make_app(settings, router_kwargs={"run_factory": factory})
+    await app.start()
+    try:
+        names = [kw["name"] for kw in app.bot.calls_for("create_forum_topic")]
+        thread = 501 + names.index("c22os")
+        app.bot.files["doc"] = b"%PDF"
+        upd = document_update(thread, "doc", "Q3 plan.pdf")
+        await app.adapter.on_document(upd, SimpleNamespace(bot=app.bot))
+        await app.adapter.drain()
+    finally:
+        await app.stop()
+
+    inbox = settings.approved_directory / ".telegram-inbox"
+    assert checks["path"].parent.parent == inbox  # <inbox>/<topic>/<file>
+    assert checks["path"].read_bytes() == b"%PDF"
+    assert isinstance(checks["new"], PermissionResultAllow)
+    # The pre-R17 layout (data/inbox under the bot's own cwd) is denied.
+    assert isinstance(checks["old"], PermissionResultDeny)
+    assert not (service_cwd / "data").exists()
