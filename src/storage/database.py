@@ -345,6 +345,35 @@ class DatabaseManager:
                     VALUES (0, 'system', 0);
                 """,
             ),
+            (
+                7,
+                """
+                -- Harness v2: per-topic session persistence + run-state rows
+                -- for restart recovery. Timestamps are epoch seconds (REAL).
+                CREATE TABLE IF NOT EXISTS harness_sessions (
+                    topic_key TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    cwd TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    last_active REAL NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS harness_runs (
+                    run_id TEXT PRIMARY KEY,
+                    topic_key TEXT NOT NULL,
+                    chat_id INTEGER,
+                    thread_id INTEGER,
+                    status TEXT NOT NULL CHECK(status IN
+                        ('running','done','stopped','error','abandoned')),
+                    started_at REAL NOT NULL,
+                    ended_at REAL,
+                    prompt_head TEXT
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_harness_runs_status
+                    ON harness_runs(status);
+                """,
+            ),
         ]
 
     async def _init_pool(self):
