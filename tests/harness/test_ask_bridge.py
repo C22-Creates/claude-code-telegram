@@ -18,6 +18,7 @@ from src.harness.run_slots import RunSlots
 from src.harness.session_store import SessionStore
 from src.harness.topic_router import TopicContext, TopicRouter
 from src.harness.types import Inbound, Outcome
+from src.security.validators import SecurityValidator
 from src.storage.database import DatabaseManager
 from tests.harness import fakes
 from tests.harness.fakes import FakeBot, FakeSDKClient
@@ -336,6 +337,7 @@ async def test_router_routes_typed_message_to_pending_question(tmp_path, setting
         settings,
         lambda inbound: TopicContext(inbound.topic_key, cwd, None),
         ask_bridge=bridge,
+        security_validator=SecurityValidator(tmp_path),
         run_factory=make_run,
     )
 
@@ -432,6 +434,7 @@ async def test_router_cancel_with_pending_question_frees_next_message(
         settings,
         lambda inbound: TopicContext(inbound.topic_key, cwd, None),
         ask_bridge=bridge,
+        security_validator=SecurityValidator(tmp_path),
         run_factory=make_run,
     )
 

@@ -82,11 +82,12 @@ class ClaudeTaskRunner:
         *,
         slots: Optional[RunSlots] = None,
         settings: Any = None,
+        security_validator: Any = None,
         run_job_fn: Callable[..., Awaitable[RunResult]] = run_job,
     ) -> None:
         # claude_integration and default_user_id are legacy: kept so main.py's
-        # old construction still imports; Task 10 drops them. Only `slots` is
-        # required to actually run a task; settings falls back to the legacy
+        # old construction still imports; Task 10 drops them. `slots` and
+        # `security_validator` are required to run a task; settings falls back to the legacy
         # integration's config.
         self._legacy_config = getattr(claude_integration, "config", None)
         self._default_working_directory = default_working_directory
@@ -94,13 +95,16 @@ class ClaudeTaskRunner:
         self._hermes_cli_path = hermes_cli_path
         self._default_user_id = default_user_id
         self._slots = slots
+        self._validator = security_validator
         self._settings = settings
         self._run_job = run_job_fn
 
     async def run(self, task: Dict[str, Any]) -> RunOutcome:
         settings = self._settings or self._legacy_config
-        if self._slots is None or settings is None:
-            raise RuntimeError("ClaudeTaskRunner needs slots and settings (Task 10)")
+        if self._slots is None or settings is None or self._validator is None:
+            raise RuntimeError(
+                "ClaudeTaskRunner needs slots, settings and security_validator"
+            )
         working_dir = self._working_directory(task)
         # The assignee's identity and tool denials are applied by the harness
         # (system prompt + disallowed tools), so the prompt carries no identity.
@@ -118,6 +122,7 @@ class ClaudeTaskRunner:
             self._slots,
             settings,
             model,
+            security_validator=self._validator,
         )
 
         if result.outcome is Outcome.DONE:
@@ -132,9 +137,7 @@ class ClaudeTaskRunner:
             return Path(payload["_working_directory"])
         return self._default_working_directory
 
-    def _build_prompt(
-        self, task: Dict[str, Any], identity: Optional[str] = None
-    ) -> str:
+    def _build_prompt(self, task: Dict[str, Any]) -> str:
         task_id = task["id"]
         payload = task.get("payload")
         payload_str = json.dumps(payload, indent=2) if payload is not None else "(none)"
@@ -143,9 +146,7 @@ class ClaudeTaskRunner:
             f"python3 {self._hermes_cli_path} --db {self._board_db_path} "
             f'block {task_id} --reason "<your specific question>"'
         )
-        identity_block = f"{identity}\n\n---\n\n" if identity else ""
         return (
-            f"{identity_block}"
             f"You are working Hermes task `{task_id}`, acting as {assignee}.\n\n"
             f"## Task\n{task['title']}\n\n"
             f"## Payload\n{payload_str}\n\n"

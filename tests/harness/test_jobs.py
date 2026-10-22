@@ -24,6 +24,7 @@ from src.harness.jobs import (
 )
 from src.harness.run_slots import RunSlots
 from src.harness.types import Inbound, Outcome, RunResult
+from src.security.validators import SecurityValidator
 from tests.harness import fakes
 from tests.harness.fakes import FakeSDKClient, message_start, result, text
 from tests.harness.test_agent_run import FakeClock
@@ -59,7 +60,7 @@ async def test_run_job_is_fresh_session_with_model_override(tmp_path, settings):
     factory = FakeSDKClient.factory(simple())
     res = await run_job(
         "hi", tmp_path, None, RunSlots(3), settings, "claude-x",
-        client_factory=factory, run_kwargs=FAST,
+        security_validator=SecurityValidator(tmp_path), client_factory=factory, run_kwargs=FAST,
     )  # fmt: skip
     assert res.outcome is Outcome.DONE and res.text == "digest ready"
     opts = factory.client.options
@@ -76,7 +77,10 @@ async def test_run_job_never_raises_on_options_error(tmp_path, settings):
     orig = jobs.build_options
     jobs.build_options = boom
     try:
-        res = await run_job("hi", tmp_path, None, RunSlots(3), settings)
+        res = await run_job(
+            "hi", tmp_path, None, RunSlots(3), settings,
+            security_validator=SecurityValidator(tmp_path),
+        )  # fmt: skip
     finally:
         jobs.build_options = orig
     assert res.outcome is Outcome.ERROR and res.reason == "bad config"
@@ -88,7 +92,7 @@ async def test_run_job_applies_60m_cap(tmp_path, settings):
     factory = FakeSDKClient.factory(script, sleep=clock.wait)
     res = await run_job(
         "long", tmp_path, None, RunSlots(3), settings,
-        client_factory=factory, run_kwargs=dict(clock=clock, sleep=clock.tick, **FAST),
+        security_validator=SecurityValidator(tmp_path), client_factory=factory, run_kwargs=dict(clock=clock, sleep=clock.tick, **FAST),
     )  # fmt: skip
     assert res.outcome is Outcome.STOPPED and res.reason == "hit 60m cap"
     assert "⚠️ stopped (hit 60m cap)" in outcome_text(res)
@@ -135,11 +139,17 @@ async def test_daily_digest_event_yields_one_response_with_original_ids(
     got = await collect(bus)
     seen = {}
 
-    async def fake_job(prompt, cwd, agent, slots, settings_, model=None):
+    async def fake_job(prompt, cwd, agent, slots, settings_, model=None, **kw):
         seen.update(prompt=prompt, cwd=cwd)
         return RunResult(outcome=Outcome.DONE, text="digest!", elapsed_s=1)
 
-    handler = ScheduledJobHandler(bus, RunSlots(3), settings, run_job_fn=fake_job)
+    handler = ScheduledJobHandler(
+        bus,
+        RunSlots(3),
+        settings,
+        security_validator=SecurityValidator(tmp_path),
+        run_job_fn=fake_job,
+    )
     handler.register()
     event = ScheduledEvent(
         job_id="j1", job_name="daily-digest", prompt="go", skill_name="daily-digest",
@@ -166,7 +176,13 @@ async def test_stopped_job_posts_text_with_footer_and_broadcasts_without_targets
             outcome=Outcome.STOPPED, text="half", elapsed_s=61, reason="hit 60m cap"
         )
 
-    handler = ScheduledJobHandler(bus, RunSlots(3), settings, run_job_fn=fake_job)
+    handler = ScheduledJobHandler(
+        bus,
+        RunSlots(3),
+        settings,
+        security_validator=SecurityValidator(tmp_path),
+        run_job_fn=fake_job,
+    )
     handler.register()
     await bus.publish(
         ScheduledEvent(job_name="x", prompt="p", working_directory=tmp_path)
@@ -188,7 +204,13 @@ async def test_handler_does_not_block_bus_so_jobs_run_concurrently(tmp_path, set
         await gate.wait()
         return RunResult(outcome=Outcome.DONE, text=prompt, elapsed_s=1)
 
-    handler = ScheduledJobHandler(bus, RunSlots(3), settings, run_job_fn=fake_job)
+    handler = ScheduledJobHandler(
+        bus,
+        RunSlots(3),
+        settings,
+        security_validator=SecurityValidator(tmp_path),
+        run_job_fn=fake_job,
+    )
     handler.register()
     for p in ("one", "two"):
         await bus.publish(
@@ -209,7 +231,13 @@ async def test_handler_survives_a_failing_job(tmp_path, settings):
             raise RuntimeError("kaboom")
         return RunResult(outcome=Outcome.DONE, text="fine", elapsed_s=1)
 
-    handler = ScheduledJobHandler(bus, RunSlots(3), settings, run_job_fn=fake_job)
+    handler = ScheduledJobHandler(
+        bus,
+        RunSlots(3),
+        settings,
+        security_validator=SecurityValidator(tmp_path),
+        run_job_fn=fake_job,
+    )
     handler.register()
     for p in ("bad", "good"):
         await bus.publish(
@@ -249,6 +277,7 @@ async def test_scheduled_job_never_injects_into_interactive_run(tmp_path, settin
         fakes.FakeBot(), store, slots, settings,
         lambda inb: TopicContext(inb.topic_key, topic_dir, None),
         run_factory=make_run,
+        security_validator=SecurityValidator(tmp_path),
     )  # fmt: skip
     inbound = Inbound(
         topic_key="topic", chat_id=1, thread_id=None, message_id=1, user_id=1, text="hi"
@@ -269,7 +298,7 @@ async def test_scheduled_job_never_injects_into_interactive_run(tmp_path, settin
     job_factory = FakeSDKClient.factory(simple("job done"))
     job_res = await run_job(
         "cron", topic_dir, None, slots, settings,
-        client_factory=job_factory, run_kwargs=FAST,
+        security_validator=SecurityValidator(tmp_path), client_factory=job_factory, run_kwargs=FAST,
     )  # fmt: skip
     assert job_res.text == "job done"
     assert job_factory.client is not interactive.client
@@ -286,7 +315,7 @@ async def test_scheduled_job_never_injects_into_interactive_run(tmp_path, settin
     async def job():
         await run_job(
             "cron2", topic_dir, None, slots, settings,
-            client_factory=FakeSDKClient.factory(simple()), run_kwargs=FAST,
+            security_validator=SecurityValidator(tmp_path), client_factory=FakeSDKClient.factory(simple()), run_kwargs=FAST,
         )  # fmt: skip
         order.append("job")
 
@@ -314,9 +343,9 @@ async def test_scheduled_job_never_injects_into_interactive_run(tmp_path, settin
 async def test_dispatcher_model_override_reaches_options(tmp_path, settings):
     factory = FakeSDKClient.factory(simple("recap done"))
 
-    async def job(prompt, cwd, agent, slots, settings_, model=None):
+    async def job(prompt, cwd, agent, slots, settings_, model=None, **kw):
         return await run_job(
-            prompt, cwd, agent, slots, settings_, model,
+            prompt, cwd, agent, slots, settings_, model, **kw,
             client_factory=factory, run_kwargs=FAST,
         )  # fmt: skip
 
@@ -326,6 +355,7 @@ async def test_dispatcher_model_override_reaches_options(tmp_path, settings):
         hermes_cli_path=Path("/tmp/cli.py"),
         slots=RunSlots(3),
         settings=settings,
+        security_validator=SecurityValidator(tmp_path),
         run_job_fn=job,
     )
     task = {
@@ -336,3 +366,114 @@ async def test_dispatcher_model_override_reaches_options(tmp_path, settings):
     outcome = await runner.run(task)
     assert outcome.content == "recap done"
     assert factory.client.options.model == JUDGMENT_MODEL
+
+
+# ------------------------------------------------------------ boundary guard
+
+
+async def _interactive_callback(tmp_path, settings, store_db):
+    """Run one interactive router turn; return the options' can_use_tool."""
+    from src.harness.session_store import SessionStore
+    from src.harness.topic_router import TopicContext, TopicRouter
+
+    store = SessionStore(store_db, projects_root=tmp_path / "projects")
+    cwd = tmp_path / "topic"
+    cwd.mkdir(exist_ok=True)
+    factory = FakeSDKClient.factory(simple())
+    router = TopicRouter(
+        fakes.FakeBot(), store, RunSlots(3), settings,
+        lambda inb: TopicContext(inb.topic_key, cwd, None),
+        security_validator=SecurityValidator(tmp_path),
+        run_factory=lambda o, p: AgentRun(o, p, settings, factory, **FAST),
+    )  # fmt: skip
+    await router.handle(
+        Inbound(
+            topic_key="t", chat_id=1, thread_id=None, message_id=1, user_id=1, text="x"
+        )
+    )
+    return factory.client.options.can_use_tool
+
+
+async def _job_callback(tmp_path, settings):
+    factory = FakeSDKClient.factory(simple())
+    await run_job(
+        "x", tmp_path, None, RunSlots(3), settings,
+        security_validator=SecurityValidator(tmp_path),
+        client_factory=factory, run_kwargs=FAST,
+    )  # fmt: skip
+    return factory.client.options.can_use_tool
+
+
+@pytest.fixture
+async def db(tmp_path):
+    from src.storage.database import DatabaseManager
+
+    manager = DatabaseManager(f"sqlite:///{tmp_path / 'g.db'}")
+    await manager.initialize()
+    yield manager
+    await manager.close()
+
+
+@pytest.mark.parametrize("kind", ["interactive", "job"])
+async def test_boundary_guard_on_every_callback(kind, tmp_path, settings, db):
+    cb = (
+        await _interactive_callback(tmp_path, settings, db)
+        if kind == "interactive"
+        else await _job_callback(tmp_path, settings)
+    )
+    outside = tmp_path.parent / "elsewhere.txt"
+    for tool in ("Write", "Edit"):
+        res = await cb(tool, {"file_path": str(outside)}, None)
+        assert isinstance(res, PermissionResultDeny)
+    res = await cb("Bash", {"command": "cd /etc && ls"}, None)
+    assert isinstance(res, PermissionResultDeny)
+    inside = await cb("Read", {"file_path": str(tmp_path / "ok.txt")}, None)
+    assert isinstance(inside, PermissionResultAllow)
+
+
+async def test_claude_internal_path_allowed(tmp_path, settings, monkeypatch):
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    plan = tmp_path / ".claude" / "plans" / "x.md"
+    plan.parent.mkdir(parents=True)
+    cb = await _job_callback(tmp_path, settings)
+    assert isinstance(
+        await cb("Write", {"file_path": str(plan)}, None), PermissionResultAllow
+    )
+
+
+async def test_unattended_still_denies_ask_question_through_guard(tmp_path, settings):
+    cb = await _job_callback(tmp_path, settings)
+    res = await cb("AskUserQuestion", {}, None)
+    assert isinstance(res, PermissionResultDeny) and res.message == NO_ONE_TO_ASK
+
+
+async def test_guard_delegates_ask_question_to_inner(tmp_path):
+    from src.harness.tool_guard import guard_can_use_tool
+
+    seen = []
+
+    async def inner(name, tool_input, ctx):
+        seen.append(name)
+        return PermissionResultAllow()
+
+    cb = guard_can_use_tool(inner, SecurityValidator(tmp_path), tmp_path, tmp_path)
+    await cb("AskUserQuestion", {"questions": []}, None)
+    assert seen == ["AskUserQuestion"]
+
+
+async def test_cancel_all_cancels_and_awaits_jobs(tmp_path, settings):
+    bus = EventBus()
+    gate = asyncio.Event()
+
+    async def fake_job(*a, **k):
+        await gate.wait()
+
+    handler = ScheduledJobHandler(
+        bus, RunSlots(3), settings,
+        security_validator=SecurityValidator(tmp_path), run_job_fn=fake_job,
+    )  # fmt: skip
+    await handler.handle_scheduled(
+        ScheduledEvent(prompt="p", working_directory=tmp_path)
+    )
+    await handler.cancel_all()
+    assert not handler._tasks

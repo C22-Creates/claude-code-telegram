@@ -27,6 +27,7 @@ from src.harness.topic_router import (
     TopicRouter,
 )
 from src.harness.types import Inbound, Outcome, RunResult
+from src.security.validators import SecurityValidator
 from src.storage.database import DatabaseManager
 from tests.harness.fakes import FakeBot, FakeSDKClient, message_start, result, text
 
@@ -76,6 +77,7 @@ class World:
         self.clients: dict[str, list[FakeSDKClient]] = {}
         self.summaries: list[str] = []
         self.summary = "SUMMARY"
+        router_kw.setdefault("security_validator", SecurityValidator(tmp_path))
         router_kw.setdefault("run_factory", self._make_run)
         router_kw.setdefault("summarize_fn", self._summarize)
         self.router = TopicRouter(

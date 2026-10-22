@@ -26,6 +26,7 @@ from src.events.types import AgentResponseEvent, ScheduledEvent
 from src.harness.agent_run import AgentRun
 from src.harness.prompt_builder import ASK_TOOL, build_options
 from src.harness.run_slots import RunSlots
+from src.harness.tool_guard import guard_can_use_tool
 from src.harness.types import Outcome, ProgressEvent, RunResult
 from src.harness.util import footer
 
@@ -63,6 +64,7 @@ async def run_job(
     settings: Settings,
     model: str | None = None,
     *,
+    security_validator: Any,
     client_factory: Callable[[Any], Any] = ClaudeSDKClient,
     run_kwargs: dict[str, Any] | None = None,
 ) -> RunResult:
@@ -73,9 +75,13 @@ async def run_job(
     ERROR result. ``run_kwargs`` (clock/sleep/timeouts) go to ``AgentRun``.
     """
     try:
-        options = build_options(
-            cwd, agent, settings, resume=None, can_use_tool=unattended_can_use_tool
+        guarded = guard_can_use_tool(
+            unattended_can_use_tool,
+            security_validator,
+            Path(cwd),
+            security_validator.approved_directory,
         )
+        options = build_options(cwd, agent, settings, resume=None, can_use_tool=guarded)
         if model:
             options = dataclasses.replace(options, model=model)
         async with slots.acquire("scheduled"):
@@ -113,11 +119,13 @@ class ScheduledJobHandler:
         slots: RunSlots,
         settings: Settings,
         *,
+        security_validator: Any,
         run_job_fn: RunJobFn = run_job,
     ) -> None:
         self.event_bus = event_bus
         self._slots = slots
         self._settings = settings
+        self._validator = security_validator
         self._run_job = run_job_fn
         self._tasks: Set[asyncio.Task[Any]] = set()
 
@@ -145,6 +153,14 @@ class ScheduledJobHandler:
         while self._tasks:
             await asyncio.gather(*list(self._tasks), return_exceptions=True)
 
+    async def cancel_all(self, timeout: float = 5.0) -> None:
+        """Cancel in-flight jobs and wait (bounded) for them; for shutdown."""
+        tasks = list(self._tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.wait(tasks, timeout=timeout)
+
     async def _run_scheduled(self, event: ScheduledEvent) -> None:
         prompt = event.prompt
         if event.skill_name:
@@ -152,7 +168,12 @@ class ScheduledJobHandler:
                 f"/{event.skill_name}\n\n{prompt}" if prompt else f"/{event.skill_name}"
             )
         result = await self._run_job(
-            prompt, event.working_directory, None, self._slots, self._settings
+            prompt,
+            event.working_directory,
+            None,
+            self._slots,
+            self._settings,
+            security_validator=self._validator,
         )
         text = outcome_text(result)
         if not text:

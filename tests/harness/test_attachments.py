@@ -58,7 +58,14 @@ def _router(tmp_path) -> TopicRouter:
         telegram_bot_username="b",
         approved_directory=str(tmp_path),
     )
-    return TopicRouter(None, None, None, settings, resolve_topic=lambda i: None)
+    return TopicRouter(
+        None,
+        None,
+        None,
+        settings,
+        resolve_topic=lambda i: None,
+        security_validator=None,
+    )
 
 
 def _inbound(attachments: list[Attachment], text: str = "look") -> Inbound:

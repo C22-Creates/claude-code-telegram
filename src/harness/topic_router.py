@@ -35,6 +35,7 @@ from src.harness.run_slots import RunSlots
 from src.harness.run_support import Prompt, first_line
 from src.harness.session_store import SessionStore
 from src.harness.status_message import StatusMessage
+from src.harness.tool_guard import guard_can_use_tool
 from src.harness.types import Inbound, Outcome, ProgressEvent, RunResult
 
 logger = structlog.get_logger()
@@ -146,6 +147,7 @@ class TopicRouter:
         resolve_topic: Callable[[Inbound], TopicContext],
         ask_bridge: AskBridgeLike | None = None,
         *,
+        security_validator: Any,
         run_factory: RunFactory | None = None,
         options_factory: OptionsFactory = build_options,
         status_factory: Callable[[Inbound], Any] | None = None,
@@ -159,6 +161,7 @@ class TopicRouter:
         self._settings = settings
         self._resolve_topic = resolve_topic
         self._ask_bridge = ask_bridge
+        self._validator = security_validator
         self._run_factory = run_factory or self._default_run
         self._options_factory = options_factory
         self._status_factory = status_factory or self._default_status
@@ -350,6 +353,13 @@ class TopicRouter:
                 )
                 if self._ask_bridge is not None
                 else allow_all
+            )
+            # Boundary checks run before the ask bridge / allow-all callback.
+            can_use_tool = guard_can_use_tool(
+                can_use_tool,
+                self._validator,
+                ctx.cwd,
+                self._validator.approved_directory,
             )
             options = self._options_factory(
                 ctx.cwd, ctx.agent, self._settings, resume, can_use_tool

@@ -92,7 +92,7 @@ class FakeRunJob:
             outcome=outcome, text=text, elapsed_s=3.0, reason=reason
         )
 
-    async def __call__(self, *args):
+    async def __call__(self, *args, **kw):
         self.calls.append(args)
         return self._result
 
@@ -104,6 +104,7 @@ def make_runner(job):
         hermes_cli_path=Path("/tmp/cli.py"),
         slots=RunSlots(3),
         settings=object(),
+        security_validator=object(),
         run_job_fn=job,
     )
 
