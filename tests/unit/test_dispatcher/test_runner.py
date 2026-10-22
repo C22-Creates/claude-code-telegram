@@ -13,7 +13,8 @@ from src.dispatcher.runner import (
     ClaudeTaskRunner,
     resolve_model,
 )
-
+from src.harness.run_slots import RunSlots
+from src.harness.types import Outcome, RunResult
 
 RECAP_DOC = "workflows/hermes-recap-runner.md"
 LEAD_DOC = "workflows/hermes-lead-runner.md"
@@ -82,32 +83,34 @@ class ResolveModelTest(unittest.TestCase):
         self.assertIsNone(resolve_model({"id": "t1", "payload": None}))
 
 
-class FakeClaudeIntegration:
-    """Records the kwargs run_command was called with."""
+class FakeRunJob:
+    """Records the args run_job was called with."""
 
-    def __init__(self):
+    def __init__(self, outcome=Outcome.DONE, text="ok", reason=""):
         self.calls = []
+        self._result = RunResult(
+            outcome=outcome, text=text, elapsed_s=3.0, reason=reason
+        )
 
-    async def run_command(self, **kwargs):
-        self.calls.append(kwargs)
+    async def __call__(self, *args):
+        self.calls.append(args)
+        return self._result
 
-        class _Response:
-            is_error = False
-            error_type = None
-            content = "ok"
 
-        return _Response()
+def make_runner(job):
+    return ClaudeTaskRunner(
+        default_working_directory=Path("/tmp"),
+        board_db_path=Path("/tmp/board.db"),
+        hermes_cli_path=Path("/tmp/cli.py"),
+        slots=RunSlots(3),
+        settings=object(),
+        run_job_fn=job,
+    )
 
 
 class ClaudeTaskRunnerModelPassthroughTest(unittest.IsolatedAsyncioTestCase):
-    async def test_resolved_model_is_passed_to_run_command(self):
-        claude = FakeClaudeIntegration()
-        runner = ClaudeTaskRunner(
-            claude_integration=claude,
-            default_working_directory=Path("/tmp"),
-            board_db_path=Path("/tmp/board.db"),
-            hermes_cli_path=Path("/tmp/cli.py"),
-        )
+    async def test_resolved_model_is_passed_to_run_job(self):
+        job = FakeRunJob()
         task = {
             "id": "t1",
             "title": "Recap: Some Meeting",
@@ -115,24 +118,29 @@ class ClaudeTaskRunnerModelPassthroughTest(unittest.IsolatedAsyncioTestCase):
             "payload": {"role": "recap", "runner_doc": RECAP_DOC, "sessionId": "abc"},
         }
 
-        await runner.run(task)
+        outcome = await make_runner(job).run(task)
 
-        self.assertEqual(len(claude.calls), 1)
-        self.assertEqual(claude.calls[0]["model"], JUDGMENT_MODEL)
+        self.assertEqual(len(job.calls), 1)
+        prompt, cwd, agent, _slots, _settings, model = job.calls[0]
+        self.assertEqual(model, JUDGMENT_MODEL)
+        self.assertEqual(agent, "meeting-processor")
+        self.assertIn("Hermes task `t1`", prompt)
+        self.assertEqual(outcome.content, "ok")
 
     async def test_no_role_leaves_model_none_unchanged_behavior(self):
-        claude = FakeClaudeIntegration()
-        runner = ClaudeTaskRunner(
-            claude_integration=claude,
-            default_working_directory=Path("/tmp"),
-            board_db_path=Path("/tmp/board.db"),
-            hermes_cli_path=Path("/tmp/cli.py"),
-        )
-        task = {"id": "t1", "title": "Ad-hoc task", "payload": None}
+        job = FakeRunJob()
+        await make_runner(job).run({"id": "t1", "title": "Ad-hoc", "payload": None})
+        self.assertIsNone(job.calls[0][5])
 
-        await runner.run(task)
+    async def test_error_raises_like_an_error_response_did(self):
+        job = FakeRunJob(Outcome.ERROR, "", "boom")
+        with self.assertRaises(RuntimeError):
+            await make_runner(job).run({"id": "t1", "title": "x", "payload": None})
 
-        self.assertIsNone(claude.calls[0]["model"])
+    async def test_stopped_task_fails_rather_than_recording_done(self):
+        job = FakeRunJob(Outcome.STOPPED, "partial", "hit 60m cap")
+        with self.assertRaisesRegex(RuntimeError, "hit 60m cap"):
+            await make_runner(job).run({"id": "t1", "title": "x", "payload": None})
 
 
 if __name__ == "__main__":
