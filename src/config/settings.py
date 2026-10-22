@@ -132,6 +132,50 @@ class Settings(BaseSettings):
             "final assistant text and shutting the CLI down."
         ),
     )
+    # --- Harness v2 (src/harness) ---
+    harness_stall_seconds: int = Field(
+        300, gt=0, description="Seconds of SDK silence before a run counts as stalled"
+    )
+    harness_heartbeat_minutes: List[int] = Field(
+        [20, 40],
+        description="Minutes into a run at which a heartbeat message is posted",
+    )
+    harness_run_cap_seconds: int = Field(
+        3600, gt=0, description="Hard wall-clock cap for a single run"
+    )
+    harness_rotate_idle_seconds: int = Field(
+        7200,
+        gt=0,
+        description="Idle seconds after which a topic's session is rotated",
+    )
+    harness_rotate_transcript_bytes: int = Field(
+        400_000,
+        gt=0,
+        description="Transcript size in bytes above which a session is rotated",
+    )
+    harness_carryover_max_words: int = Field(
+        300, gt=0, description="Max words in the carryover summary for a new session"
+    )
+    harness_concurrency_cap: int = Field(
+        3, gt=0, description="Max runs executing concurrently across topics"
+    )
+    harness_ask_expiry_seconds: int = Field(
+        1800, gt=0, description="Seconds before an unanswered AskUserQuestion expires"
+    )
+    harness_status_edit_interval_seconds: int = Field(
+        5, gt=0, description="Minimum seconds between status-message edits"
+    )
+    harness_end_turn_grace_seconds: int = Field(
+        15,
+        gt=0,
+        description=(
+            "Seconds to wait for the CLI's ResultMessage after the model ends "
+            "its turn before the harness finishes the run itself"
+        ),
+    )
+    harness_carryover_model: str = Field(
+        "claude-haiku-5-5", description="Model used to write the carryover summary"
+    )
     claude_max_cost_per_user: float = Field(
         DEFAULT_CLAUDE_MAX_COST_PER_USER, description="Max cost per user"
     )
