@@ -608,3 +608,20 @@ async def test_supervisor_failure_ends_run_with_error(settings):
     h.run._sleep = broken_sleep
     res = await asyncio.wait_for(h.run.run("q"), 1)
     assert (res.outcome, res.reason) == (Outcome.ERROR, "tick broke")
+
+
+async def test_elapsed_s_counts_while_running_and_is_zero_after(settings):
+    seen: list[float] = []
+
+    async def peek(event: ProgressEvent) -> None:
+        seen.append(h.run.elapsed_s)
+
+    h = Harness(
+        [(0, fakes.message_start()), (240, fakes.text("a")), (0, fakes.result())],
+        settings,
+        on_progress=peek,
+    )
+    assert h.run.elapsed_s == 0.0
+    await h.run.run("hi")
+    assert seen and max(seen) >= 240
+    assert h.run.elapsed_s == 0.0

@@ -88,6 +88,11 @@ class AgentRun:
     def is_active(self) -> bool:
         return self._active
 
+    @property
+    def elapsed_s(self) -> float:
+        """Seconds since this run started (for ``/status``)."""
+        return self._elapsed() if self._active else 0.0
+
     async def run(self, prompt: Prompt) -> RunResult:
         """Run *prompt* to completion; always returns a ``RunResult``."""
         if self._active:

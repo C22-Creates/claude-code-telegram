@@ -28,6 +28,7 @@ import structlog
 from claude_agent_sdk import CanUseTool, ClaudeAgentOptions, PermissionResultAllow
 
 from src.harness.agent_run import AgentRun
+from src.harness.attachments import image_block
 from src.harness.carryover import summarize_for_carryover
 from src.harness.prompt_builder import build_options
 from src.harness.run_slots import RunSlots
@@ -424,13 +425,28 @@ class TopicRouter:
         return None, (summary or "").strip()
 
     def _build_prompt(self, inbound: Inbound) -> Prompt:
-        """The user's message as a prompt. Task 8 extends this (image blocks).
+        """The user's message as a prompt.
 
-        Attachments are listed by path so the agent can open them.
+        Every attachment is listed by path so the agent can open it; photos are
+        also sent inline as image blocks (before the text) so the model sees
+        them without a tool call. An unreadable photo keeps only its path line.
         """
         lines = [inbound.text]
-        lines += [f"[attached {a.kind}: {a.path}]" for a in inbound.attachments]
-        return "\n\n".join(line for line in lines if line)
+        lines += [f"Attached file: {a.path}" for a in inbound.attachments]
+        text = "\n\n".join(line for line in lines if line)
+        images: list[dict[str, Any]] = []
+        for a in inbound.attachments:
+            if a.kind != "photo":
+                continue
+            try:
+                images.append(image_block(a))
+            except OSError as exc:
+                logger.warning(
+                    "harness.image_unreadable", path=str(a.path), error=str(exc)
+                )
+        if not images:
+            return text
+        return [*images, {"type": "text", "text": text}]
 
     # ------------------------------------------------------- telegram helpers
 

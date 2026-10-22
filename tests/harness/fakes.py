@@ -7,6 +7,7 @@ milliseconds.
 import asyncio
 import inspect
 from itertools import count
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, AsyncIterator, Awaitable, Callable
 
@@ -284,6 +285,7 @@ class FakeBot:
         self.calls: list[tuple[str, dict[str, Any]]] = []
         self._ids = count(1)
         self._failures: dict[str, list[BaseException]] = {}
+        self.files: dict[str, bytes] = {}  # get_file() contents by file_id
 
     def fail_next(self, method: str, exc: BaseException) -> None:
         """Make the next ``method`` call raise ``exc`` (queued FIFO)."""
@@ -337,3 +339,27 @@ class FakeBot:
     async def answer_callback_query(self, **kwargs: Any) -> bool:
         self._record("answer_callback_query", kwargs)
         return True
+
+    async def delete_message(self, **kwargs: Any) -> bool:
+        self._record("delete_message", kwargs)
+        return True
+
+    async def get_file(self, **kwargs: Any) -> "FakeFile":
+        """A downloadable file; contents come from ``self.files[file_id]``."""
+        self._record("get_file", kwargs)
+        data = self.files.get(kwargs["file_id"], b"file-bytes")
+        return FakeFile(kwargs["file_id"], data)
+
+
+class FakeFile:
+    """Stand-in for ``telegram.File``: ``download_to_drive`` writes the bytes."""
+
+    def __init__(self, file_id: str, data: bytes) -> None:
+        self.file_id = file_id
+        self.file_size = len(data)
+        self._data = data
+
+    async def download_to_drive(self, custom_path: Any = None) -> Path:
+        path = Path(custom_path)
+        path.write_bytes(self._data)
+        return path
