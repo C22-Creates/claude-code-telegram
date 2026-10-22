@@ -34,3 +34,21 @@ Run 1 and run 2 behaved identically.
 - SDK source (`claude_agent_sdk/_internal/query.py`): inbound `can_use_tool` control requests are run as a spawned task (`_handle_control_request`) with no timeout; the only control-request timeouts are on requests the SDK sends to the CLI (`initialize` 60s, others 60s via `anyio.fail_after`). Nothing bounds how long our callback may take.
 - Live check (real CLI, `claude-haiku-4-5-20251001`, no MCP, scratch cwd): AskUserQuestion callback slept 120s before returning `PermissionResultAllow(updated_input={..., "answers": {q: "blue"}})`. Callback fired at 7.24s, returned at 127.31s; the tool_result arrived 0.2s later ("The user answered: ... = \"blue\""), the run continued and ended with one ResultMessage ("You chose Blue"). The answer round-trips after a 2-minute human delay.
 - Not tested beyond 120s; no hard CLI-side timeout was observed or found in the SDK. The bridge's own 30-minute expiry (`harness_ask_expiry_seconds=1800`) is the effective limit.
+
+## (e) live replays (Task 11)
+
+`HARNESS_LIVE=1 .venv/bin/pytest tests/live -s` (TopicRouter + real AgentRun +
+real ClaudeSDKClient + live MCP config, FakeBot, cwd c22os, production model).
+Max status gap = longest silence between consecutive bot sends/edits (status
+edits coalesce at 5s, so ~5s is the floor). `contact-lookup` detected as a
+`Skill` tool use whose input contains "contact-lookup".
+
+| Replay | Run | Elapsed | Tool calls | contact-lookup | Max status gap | Footer |
+|---|---|---|---|---|---|---|
+| 10/17 McGovern lookup | 1 | 21.1s | 3 (Skill, Bash, notion-query-data-sources) | yes | 5.0s | ✅ done · 21s |
+| 10/17 McGovern lookup | 2 | 16.6s | 3 (same) | yes | 5.0s | ✅ done · 16s |
+| 10/14 resumed multi-step | 1 | 33.7s | 6 (Bash x6) | n/a | 8.3s | ✅ done · 33s |
+| 10/14 resumed multi-step | 2 | 34.5s | 6 (Bash x6) | n/a | 5.0s | ✅ done · 34s |
+
+Targets (< 60s, <= 8 tools, contact-lookup used; gap <= 300s; explicit footer):
+all met in all 4 runs.
