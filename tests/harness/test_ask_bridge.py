@@ -448,5 +448,5 @@ async def test_router_cancel_with_pending_question_frees_next_message(
 
     await asyncio.wait_for(router.handle(inbound("next", 101)), 5)
     assert factories == []  # "next" started a second run instead of being eaten
-    assert isinstance(await captured["task"], PermissionResultDeny)
+    assert isinstance(await asyncio.wait_for(captured["task"], 5), PermissionResultDeny)
     await db.close()
