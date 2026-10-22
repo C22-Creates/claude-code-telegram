@@ -306,12 +306,14 @@ class TopicRouter:
         opening: str | None,
     ) -> None:
         key = ctx.topic_key
-        status = self._status_factory(inbound)
-        queued = self._slots.would_wait()
-        await self._open_status(status, opening, queued)
         run_id: str | None = None
         db_status = "error"
         try:
+            # Inside the try: a failing factory must still close the flow,
+            # or the topic would stay busy forever.
+            status = self._status_factory(inbound)
+            queued = self._slots.would_wait()
+            await self._open_status(status, opening, queued)
             async with self._slots.acquire("interactive"):
                 if queued:
                     await self._note(status, opening or STARTING_TEXT)
@@ -336,6 +338,10 @@ class TopicRouter:
                         result = await self._execute(
                             worker, ctx, inbound, resume, summary, status
                         )
+                        if self._resume_failed(worker, resume, result):
+                            result = await self._retry_fresh(
+                                worker, ctx, inbound, resume, status
+                            )
                 if result is None:
                     result = RunResult(
                         outcome=Outcome.STOPPED,
@@ -412,6 +418,45 @@ class TopicRouter:
         finally:
             worker.run = None
             await self._clear_asks(ctx.topic_key)
+
+    def _resume_failed(
+        self, worker: TopicWorker, resume: str | None, result: RunResult | None
+    ) -> bool:
+        """An ERROR before the CLI said anything while resuming a session.
+
+        The CLI exits with a generic error when the stored session is gone;
+        without a fresh retry every message would fail until /new or the
+        idle rotation (the old facade's resume fallback).
+        """
+        return (
+            resume is not None
+            and result is not None
+            and result.outcome is Outcome.ERROR
+            and result.events_seen == 0
+            and not worker.reset_requested
+            and not worker.discard_session
+            and not worker.cancel_requested
+            and not self._closing
+        )
+
+    async def _retry_fresh(
+        self,
+        worker: TopicWorker,
+        ctx: TopicContext,
+        inbound: Inbound,
+        resume: str,
+        status: Any,
+    ) -> RunResult | None:
+        """Drop the unresumable session and run once more, fresh, same status."""
+        logger.warning(
+            "harness.resume_failed_retry_fresh", topic=ctx.topic_key, session=resume
+        )
+        try:
+            await self._store.clear(ctx.topic_key)
+        except Exception:  # noqa: BLE001 - the fresh run is still worth trying
+            logger.exception("harness.session_clear_failed", topic=ctx.topic_key)
+        worker.run_started = False
+        return await self._execute(worker, ctx, inbound, None, "", status)
 
     async def _clear_asks(self, topic_key: str) -> None:
         """Best effort: a dead run must not leave a question pending."""

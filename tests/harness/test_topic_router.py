@@ -830,3 +830,111 @@ async def test_run_finishing_on_its_own_during_shutdown_is_recorded(
     run.gate.set()
     await task
     assert await run_rows(store) == [("t", "done")]
+
+
+# ------------------------------------------- final-review fixes (I2, I5, M8)
+
+
+def dead_cli():
+    from claude_agent_sdk import ProcessError
+
+    return [("raise", ProcessError("Command failed with exit code 1", exit_code=1))]
+
+
+async def test_unresumable_session_retries_fresh_once(tmp_path, settings, store):
+    w = World(tmp_path, settings, store)
+    await store.save("t", "gone", w.cwd("t"))
+    w.script("t", dead_cli())
+    w.script("t", simple(session="new"))
+    await w.router.handle(msg())
+    assert w.client("t", 0).options.resume == "gone"
+    assert w.client("t", 1).options.resume is None
+    assert w.client("t", 1).queries == ["hello"]  # no carry-over summary
+    assert w.summaries == []
+    sent = w.sent_texts()
+    assert sent[0] == STARTING_TEXT and len(sent) == 2  # one status message
+    assert w.edited_texts()[-1].startswith("✅ done")
+    assert (await store.get("t")).session_id == "new"
+    assert await run_rows(store) == [("t", "done")]
+    assert w.slots.in_use == 0
+
+
+async def test_resume_failure_after_events_is_not_retried(tmp_path, settings, store):
+    w = World(tmp_path, settings, store)
+    await store.save("t", "live", w.cwd("t"))
+    w.script("t", [(0, message_start()), *dead_cli()])
+    await w.router.handle(msg())
+    assert len(w.clients["t"]) == 1
+    assert w.edited_texts()[-1].startswith("❌ error")
+    assert (await store.get("t")).session_id == "live"
+
+
+async def test_fresh_run_error_is_not_retried(tmp_path, settings, store):
+    w = World(tmp_path, settings, store)
+    w.script("t", dead_cli())
+    await w.router.handle(msg())
+    assert len(w.clients["t"]) == 1
+    assert w.edited_texts()[-1].startswith("❌ error")
+
+
+async def test_fresh_retry_happens_only_once(tmp_path, settings, store):
+    w = World(tmp_path, settings, store)
+    await store.save("t", "gone", w.cwd("t"))
+    w.script("t", dead_cli())
+    w.script("t", dead_cli())
+    await w.router.handle(msg())
+    assert len(w.clients["t"]) == 2
+    assert w.edited_texts()[-1].startswith("❌ error")
+    assert await store.get("t") is None  # the dead session was dropped
+    assert await run_rows(store) == [("t", "error")]
+
+
+async def test_raising_status_factory_does_not_wedge_topic(tmp_path, settings, store):
+    calls = {"n": 0}
+    w = World(tmp_path, settings, store)
+
+    def flaky(inbound):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("status broke")
+        return w.router._default_status(inbound)
+
+    w.router._status_factory = flaky
+    w.script("t", simple())
+    with pytest.raises(RuntimeError):
+        await w.router.handle(msg())
+    assert w.router._workers["t"].flow_done is None
+    await asyncio.wait_for(w.router.handle(msg(text_="again")), 2)
+    assert w.client("t").queries == ["again"]
+
+
+async def test_hung_carryover_still_starts_the_run(tmp_path, settings, store):
+    import functools
+
+    from src.harness import carryover
+
+    release = asyncio.Event()
+
+    async def stubborn(*, prompt, options, transport=None):
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            await release.wait()  # a wedged CLI swallowing the cancel
+        yield None
+
+    summarize = functools.partial(
+        carryover.summarize_for_carryover,
+        query_fn=stubborn,
+        timeout=0.05,
+        close_timeout=0.05,
+        transport_factory=lambda prompt, options: object(),
+    )
+    w = World(tmp_path, settings, store, summarize_fn=summarize)
+    await store.save("t", "old", w.cwd("t"), now=time.time() - 3 * HOUR)
+    w.script("t", simple(session="new"))
+    await asyncio.wait_for(w.router.handle(msg()), 2)
+    assert w.client("t").options.resume is None
+    assert w.client("t").queries == ["hello"]
+    assert (await store.get("t")).session_id == "new"
+    assert w.slots.in_use == 0
+    release.set()
