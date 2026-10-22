@@ -1,8 +1,8 @@
 """SDK lifecycle helpers: turn detection, bounded cancellation, child reaping.
 
-Ported verbatim from ``src/claude/sdk_integration.py`` (module-level functions
-instead of ``ClaudeSDKManager`` methods) so the harness package does not depend
-on the old one. The docstrings carry the incident history -- keep them.
+Ported verbatim from the old ``claude/sdk_integration.py`` (module-level
+functions instead of ``ClaudeSDKManager`` methods; the old package is gone).
+The docstrings carry the incident history -- keep them.
 """
 
 import asyncio

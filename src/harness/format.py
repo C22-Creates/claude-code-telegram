@@ -1,7 +1,7 @@
 """HTML formatting utilities for Telegram messages.
 
-Copied from ``src/bot/utils/html_format.py`` (which stays until the old stack is
-deleted) plus ``split_message``.
+Originally ``bot/utils/html_format.py`` (removed with the old stack), plus
+``split_message``.
 
 Telegram's HTML mode only requires escaping 3 characters (<, >, &) vs the many
 ambiguous Markdown v1 metacharacters, making it far more robust for rendering

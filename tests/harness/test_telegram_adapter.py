@@ -652,3 +652,44 @@ async def test_same_named_documents_do_not_overwrite_each_other(world):
     paths = [inbound.attachments[0].path for inbound, _ in world.router.calls]
     assert paths[0] != paths[1]
     assert [p.read_bytes() for p in paths] == [b"one", b"two"]
+
+
+def test_build_application_keeps_production_connection_settings(world, monkeypatch):
+    monkeypatch.delenv("HTTP_PROXY", raising=False)
+    monkeypatch.setenv("HTTPS_PROXY", "http://u:secret@proxy.internal:3128")
+    updates_req, req = world.adapter.build_application().bot._request
+    assert updates_req._client_kwargs["limits"].max_connections == 8
+    assert req._client_kwargs["timeout"].pool == 30
+    assert req._client_kwargs["proxy"] == "http://u:secret@proxy.internal:3128"
+    assert updates_req._client_kwargs["proxy"] == "http://u:secret@proxy.internal:3128"
+
+
+def test_build_application_without_proxy(world, monkeypatch):
+    monkeypatch.delenv("HTTP_PROXY", raising=False)
+    monkeypatch.delenv("HTTPS_PROXY", raising=False)
+    _, req = world.adapter.build_application().bot._request
+    assert req._client_kwargs.get("proxy") is None
+
+
+async def test_drain_with_timeout_cancels_stragglers(world):
+    hung = asyncio.Event()
+    cancelled = []
+
+    async def forever():
+        try:
+            await hung.wait()
+        except asyncio.CancelledError:
+            cancelled.append(True)
+            raise
+
+    world.adapter._spawn(forever(), "test")
+    await asyncio.wait_for(world.adapter.drain(timeout=0.01), 1)
+    assert cancelled == [True]
+    assert world.adapter.pending_tasks == 0
+
+
+def test_bind_replaces_router_and_ask_bridge(world):
+    router, ask = FakeRouter(), FakeAskBridge()
+    world.adapter.bind(router, ask)
+    assert world.adapter._router is router
+    assert world.adapter._ask_bridge is ask

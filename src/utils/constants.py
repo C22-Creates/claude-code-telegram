@@ -6,16 +6,6 @@ APP_DESCRIPTION = "Telegram bot for remote Claude Code access"
 
 # Default limits
 DEFAULT_CLAUDE_TIMEOUT_SECONDS = 300
-# Max seconds to wait for the *next* SDK message before treating the stream
-# as stalled. Bounds a single hung step (most often an outbound MCP tool
-# call, e.g. a Notion write that never returns) well under the full session
-# budget above, instead of silently spending all of it. See failure mode #39.
-DEFAULT_CLAUDE_TOOL_IDLE_TIMEOUT_SECONDS = 120
-# After the model ends its turn (stop_reason=end_turn, no tool call pending),
-# seconds to wait for the CLI's ResultMessage before completing the run anyway.
-# Resumed sessions were seen idling 5-20+ minutes between the final assistant
-# message and the result (2026-10-17), holding finished replies hostage.
-DEFAULT_CLAUDE_END_TURN_GRACE_SECONDS = 15
 DEFAULT_CLAUDE_MAX_TURNS = 10
 DEFAULT_CLAUDE_MAX_COST_PER_USER = 10.0
 DEFAULT_CLAUDE_MAX_COST_PER_REQUEST = 5.0
@@ -108,12 +98,6 @@ DEFAULT_BACKUP_RETENTION_DAYS = 30
 # Claude Code defaults
 DEFAULT_CLAUDE_BINARY = "claude"
 DEFAULT_CLAUDE_OUTPUT_FORMAT = "stream-json"
-
-# Retry defaults
-DEFAULT_RETRY_MAX_ATTEMPTS = 3
-DEFAULT_RETRY_BASE_DELAY = 1.0
-DEFAULT_RETRY_BACKOFF_FACTOR = 3.0
-DEFAULT_RETRY_MAX_DELAY = 30.0
 
 # Logging
 LOG_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"

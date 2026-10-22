@@ -1,7 +1,7 @@
 """Path and bash boundary guard for every harness tool call.
 
-Ported from ``src/claude/monitor.py`` and ``_make_can_use_tool_callback`` in
-``src/claude/sdk_integration.py`` (deleted in Task 10). Production routed every
+Ported from ``claude/monitor.py`` and ``_make_can_use_tool_callback`` in
+``claude/sdk_integration.py`` (both since deleted). Production routed every
 tool call through these checks; ``guard_can_use_tool`` restores that for
 interactive and unattended runs alike, delegating to the run's own callback
 (AskBridge, allow-all, unattended) only after the checks pass.

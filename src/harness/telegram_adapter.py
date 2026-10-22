@@ -16,6 +16,7 @@ the router and caches the result per topic key; ``resolve_topic`` reads it.
 """
 
 import asyncio
+import os
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
 from datetime import datetime
@@ -37,7 +38,7 @@ from telegram.ext import (
 from src.harness.attachments import inbox_path
 from src.harness.topic_router import TopicContext
 from src.harness.types import Attachment, Inbound
-from src.harness.util import fmt_elapsed
+from src.harness.util import fmt_elapsed, redact_proxy_url
 
 logger = structlog.get_logger()
 
@@ -138,9 +139,18 @@ class TelegramAdapter:
 
     # ------------------------------------------------------------- public API
 
+    def bind(self, router: Any, ask_bridge: Any) -> None:
+        """Late-bind the router and ask bridge.
+
+        Both need the application's ``bot``, and the router needs this
+        adapter's ``resolve_topic``, so the app builds the adapter first.
+        """
+        self._router = router
+        self._ask_bridge = ask_bridge
+
     def build_application(self) -> Application:
         """A PTB application with every harness handler registered."""
-        app = (
+        builder = (
             Application.builder()
             .token(self._settings.telegram_token_str)
             .rate_limiter(AIORateLimiter(max_retries=1))
@@ -148,8 +158,19 @@ class TelegramAdapter:
             .connect_timeout(30)
             .read_timeout(30)
             .write_timeout(30)
-            .build()
+            .pool_timeout(30)
+            # A getUpdates torn down mid-flight can leave the default
+            # one-connection pool checked out forever ("Pool timeout"); a
+            # small pool lets polling recover on its own (old bot/core.py).
+            .get_updates_connection_pool_size(8)
         )
+        # PTB ignores HTTP(S)_PROXY; without an explicit proxy the httpx pool
+        # can wedge behind one (old bot/core.py).
+        proxy_url = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY")
+        if proxy_url:
+            builder = builder.proxy(proxy_url).get_updates_proxy(proxy_url)
+            logger.info("harness.proxy_configured", proxy=redact_proxy_url(proxy_url))
+        app = builder.build()
         for name, callback in self._commands().items():
             app.add_handler(CommandHandler(name, callback))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.on_text))
@@ -177,8 +198,22 @@ class TelegramAdapter:
     def pending_tasks(self) -> int:
         return len(self._tasks)
 
-    async def drain(self) -> None:
-        """Wait for every in-flight update task (shutdown, tests)."""
+    async def drain(self, timeout: float | None = None) -> None:
+        """Wait for every in-flight update task (shutdown, tests).
+
+        With ``timeout``, tasks still running when it elapses are cancelled
+        and awaited, so shutdown stays bounded.
+        """
+        try:
+            await asyncio.wait_for(self._drain(), timeout)
+        except asyncio.TimeoutError:
+            stragglers = list(self._tasks)
+            logger.warning("harness.drain_timeout", cancelled=len(stragglers))
+            for task in stragglers:
+                task.cancel()
+            await asyncio.gather(*stragglers, return_exceptions=True)
+
+    async def _drain(self) -> None:
         while self._tasks:
             await asyncio.gather(*list(self._tasks), return_exceptions=True)
 

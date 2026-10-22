@@ -1,8 +1,7 @@
-"""Tests for the SDK lifecycle helpers ported from src/claude/sdk_integration.py.
+"""Tests for the SDK lifecycle helpers ported from claude/sdk_integration.py.
 
 The incident tests (await-cancelled, reap) are copies of the originals,
-retargeted at module-level functions; the originals stay until src/claude/ is
-deleted.
+retargeted at module-level functions (the old claude/ package is deleted).
 """
 
 import asyncio

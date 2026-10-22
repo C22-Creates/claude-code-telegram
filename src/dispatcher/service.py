@@ -37,7 +37,7 @@ MAX_RESULT_CHARS = 4000
 # Markers that indicate a Claude session's response text is actually a
 # surfaced API-level failure. The Claude Agent SDK returns these as normal
 # ResultMessage content (ClaudeResponse.is_error stays False) rather than
-# raising -- see src/claude/sdk_integration.py -- so the dispatcher must
+# raising -- see the old claude/sdk_integration.py -- so the dispatcher must
 # inspect the content itself before completing a task, or a session that
 # failed mid-flight gets marked done. Audit finding 8/17 (task 6b0be48b...):
 # a 529 overloaded_error response was recorded as done with the API error

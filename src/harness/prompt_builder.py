@@ -1,7 +1,8 @@
 """System prompt and SDK options for a harness run.
 
-Mirrors the production construction in ``src/claude/sdk_integration.py``
-(``execute_command``) so a topic behaves the same under the harness, except
+Mirrors the construction of the old ``claude/sdk_integration.py``
+(``execute_command``, removed with the old stack) so a topic behaves the same
+under the harness, except
 for the two intentional changes: ``permission_mode="default"`` with the
 caller's ``can_use_tool`` (the only combination that routes AskUserQuestion to
 the callback). Path and bash boundary checks are not applied here: callers

@@ -22,6 +22,7 @@ from src.harness.topic_router import (
     EYES,
     QUEUED_BEHIND,
     QUEUED_TEXT,
+    RESTARTING,
     STARTING_TEXT,
     TopicContext,
     TopicRouter,
@@ -772,3 +773,60 @@ async def test_new_after_run_returned_before_save_sticks(tmp_path, settings, sto
     await w.router.handle(msg(text_="next"))
     assert second.options.resume is None
     assert (await store.get("t")).session_id == "post-new"
+
+
+# ------------------------------------------------------------------- shutdown
+
+
+async def test_shutdown_interrupts_live_run_and_leaves_row_running(
+    tmp_path, settings, store
+):
+    """A process stop interrupts the run but keeps its row 'running' so the
+    next boot posts the restart notice (and only then marks it abandoned)."""
+    w = World(tmp_path, settings, store)
+    gate, reached = asyncio.Event(), asyncio.Event()
+    w.script("t", gated(gate, reached=reached))
+    task = asyncio.create_task(w.router.handle(msg()))
+    await reached.wait()
+    assert await w.router.shutdown() == 1
+    await task
+    assert w.client("t").interrupted == 1
+    assert w.edited_texts()[-1].startswith(f"⚠️ stopped ({RESTARTING}) · ")
+    assert (await store.get("t")).session_id == "sess-1"  # resumable
+    assert await run_rows(store) == [("t", "running")]
+
+
+async def test_shutdown_stops_queued_flow_before_it_runs(tmp_path, settings, store):
+    blocker = FakeRun()
+    w = World(tmp_path, settings, store, cap=1, run_factory=fake_runs([blocker]))
+    tb = asyncio.create_task(w.router.handle(msg("other")))
+    await until(lambda: blocker.prompts)
+    t1 = asyncio.create_task(w.router.handle(msg("t")))
+    await until(lambda: QUEUED_TEXT in w.sent_texts())
+    await w.router.shutdown()
+    blocker.gate.set()  # FakeRun ignores interrupt; let it return
+    await asyncio.gather(tb, t1)
+    assert w.edited_texts()[-1].startswith(f"⚠️ stopped ({RESTARTING})")
+    assert await run_rows(store) == [("other", "running")]
+
+
+async def test_message_after_shutdown_never_starts_a_run(tmp_path, settings, store):
+    w = World(tmp_path, settings, store, run_factory=fake_runs([]))
+    await w.router.shutdown()
+    await w.router.handle(msg())
+    assert w.edited_texts()[-1].startswith(f"⚠️ stopped ({RESTARTING})")
+    assert await run_rows(store) == []
+
+
+async def test_run_finishing_on_its_own_during_shutdown_is_recorded(
+    tmp_path, settings, store
+):
+    run = FakeRun()
+    w = World(tmp_path, settings, store, run_factory=fake_runs([run]))
+    task = asyncio.create_task(w.router.handle(msg()))
+    await until(lambda: run.prompts)
+    run.is_active = False  # already returned; nothing left to interrupt
+    assert await w.router.shutdown() == 0
+    run.gate.set()
+    await task
+    assert await run_rows(store) == [("t", "done")]

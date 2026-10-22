@@ -1,8 +1,9 @@
 """Production task runner: executes a board task as a Claude session.
 
 Builds a prompt from the task, runs it via the harness (``run_job``: fresh
-session, ``scheduled`` slot priority), and reports the result. The worker is told how to self-block via the Hermes CLI
-when it needs a human — the dispatcher reconciles against live board state afterward.
+session, ``scheduled`` slot priority), and reports the result. The worker is
+told how to self-block via the Hermes CLI when it needs a human -- the
+dispatcher reconciles against live board state afterward.
 """
 
 import json
@@ -15,7 +16,6 @@ from ..harness.jobs import run_job
 from ..harness.run_slots import RunSlots
 from ..harness.types import Outcome, RunResult
 from ..harness.util import footer
-from ..utils.constants import SYSTEM_USER_ID
 from .service import RunOutcome
 
 logger = structlog.get_logger()
@@ -74,37 +74,24 @@ class ClaudeTaskRunner:
 
     def __init__(
         self,
-        claude_integration: Any = None,
-        default_working_directory: Path = Path("."),
-        board_db_path: Path = Path("board.db"),
-        hermes_cli_path: Path = Path("cli.py"),
-        default_user_id: int = SYSTEM_USER_ID,
+        default_working_directory: Path,
+        board_db_path: Path,
+        hermes_cli_path: Path,
         *,
-        slots: Optional[RunSlots] = None,
-        settings: Any = None,
-        security_validator: Any = None,
+        slots: RunSlots,
+        settings: Any,
+        security_validator: Any,
         run_job_fn: Callable[..., Awaitable[RunResult]] = run_job,
     ) -> None:
-        # claude_integration and default_user_id are legacy: kept so main.py's
-        # old construction still imports; Task 10 drops them. `slots` and
-        # `security_validator` are required to run a task; settings falls back to the legacy
-        # integration's config.
-        self._legacy_config = getattr(claude_integration, "config", None)
         self._default_working_directory = default_working_directory
         self._board_db_path = board_db_path
         self._hermes_cli_path = hermes_cli_path
-        self._default_user_id = default_user_id
         self._slots = slots
         self._validator = security_validator
         self._settings = settings
         self._run_job = run_job_fn
 
     async def run(self, task: Dict[str, Any]) -> RunOutcome:
-        settings = self._settings or self._legacy_config
-        if self._slots is None or settings is None or self._validator is None:
-            raise RuntimeError(
-                "ClaudeTaskRunner needs slots, settings and security_validator"
-            )
         working_dir = self._working_directory(task)
         # The assignee's identity and tool denials are applied by the harness
         # (system prompt + disallowed tools), so the prompt carries no identity.
@@ -120,7 +107,7 @@ class ClaudeTaskRunner:
             working_dir,
             task.get("assignee"),
             self._slots,
-            settings,
+            self._settings,
             model,
             security_validator=self._validator,
         )

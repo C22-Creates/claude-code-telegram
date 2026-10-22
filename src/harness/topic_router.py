@@ -47,6 +47,7 @@ EYES = "👀"
 QUEUED_BEHIND = "🫡"
 CANCELLED = "cancelled"  # footer: "⚠️ stopped (cancelled) · {elapsed}"
 NEW_SESSION = "new session"
+RESTARTING = "restarting"  # process shutdown; the next boot posts the ♻️ notice
 CARRYOVER_HEADER = "Context from previous session:"
 
 
@@ -126,6 +127,7 @@ class TopicWorker:
         self.reset_requested = False  # /new landed before the run started
         self.run_started = False  # the flow's run was published (may have returned)
         self.discard_session = False
+        self.shutdown = False  # stopped by a process shutdown: keep row 'running'
 
 
 RunFactory = Callable[
@@ -169,6 +171,7 @@ class TopicRouter:
         self._clock = clock
         self._wall_clock = wall_clock
         self._workers: dict[str, TopicWorker] = {}
+        self._closing = False
 
     # ------------------------------------------------------------- public API
 
@@ -235,6 +238,35 @@ class TopicRouter:
             worker.cancel_requested = True
         return True
 
+    async def shutdown(self) -> int:
+        """Process stop: interrupt every live run; return how many.
+
+        Interrupting (rather than letting the process die mid-turn) lets each
+        run end cleanly and save its session, so "reply to resume" really
+        resumes. Their ``harness_runs`` rows are deliberately left 'running':
+        the next boot posts the restart notice to those topics and only then
+        marks them abandoned. Flows still queued or starting never start their
+        run, and no new run starts after this.
+        """
+        self._closing = True
+        interrupted = 0
+        for key, worker in list(self._workers.items()):
+            if worker.flow_done is None:
+                continue
+            run = worker.run
+            if run is None:
+                worker.cancel_requested = True
+                continue
+            if not run.is_active:
+                continue  # already returned; its flow records the outcome
+            worker.shutdown = True
+            interrupted += 1
+            try:
+                await run.interrupt(RESTARTING)
+            except Exception:  # noqa: BLE001 - keep stopping the others
+                logger.exception("harness.shutdown_interrupt_failed", topic=key)
+        return interrupted
+
     def active_run(self, topic_key: str) -> Any:
         """The topic's executing ``AgentRun``, or None."""
         worker = self._workers.get(topic_key)
@@ -284,7 +316,7 @@ class TopicRouter:
                 if queued:
                     await self._note(status, opening or STARTING_TEXT)
                 started = self._clock()
-                if worker.cancel_requested:
+                if worker.cancel_requested or self._closing:
                     result: RunResult | None = None
                 else:
                     try:
@@ -309,7 +341,7 @@ class TopicRouter:
                         outcome=Outcome.STOPPED,
                         text="",
                         elapsed_s=0.0,
-                        reason=CANCELLED,
+                        reason=RESTARTING if self._closing else CANCELLED,
                     )
             await self._finish_status(status, result)
             if result.session_id and not worker.discard_session:
@@ -322,7 +354,8 @@ class TopicRouter:
             db_status = "stopped"
             raise
         finally:
-            if run_id is not None:
+            # A run stopped by shutdown stays 'running' for the next boot.
+            if run_id is not None and not worker.shutdown:
                 await self._end_run(run_id, db_status)
             self._close_flow(worker)
 
@@ -366,7 +399,7 @@ class TopicRouter:
             )
             run = self._run_factory(options, status.update)
             ref.bind(run)
-            if worker.cancel_requested:  # /cancel landed during setup
+            if worker.cancel_requested or self._closing:  # /cancel or shutdown
                 return None
             # No await between publishing the run and run() entry, so /cancel
             # and inject() always see an active run once it is visible.
@@ -411,6 +444,7 @@ class TopicRouter:
         worker.reset_requested = False
         worker.run_started = False
         worker.discard_session = False
+        worker.shutdown = False
         if done is not None:
             done.set()
 

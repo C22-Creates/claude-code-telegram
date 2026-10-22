@@ -1,8 +1,10 @@
 """Tests for harness settings, types and formatting helpers."""
 
+import pytest
+
 from src.config.settings import Settings
 from src.harness.types import Outcome, RunResult
-from src.harness.util import fmt_elapsed, footer
+from src.harness.util import fmt_elapsed, footer, redact_proxy_url
 
 
 def test_fmt_elapsed():
@@ -61,3 +63,27 @@ def test_harness_settings_env_override(tmp_path, monkeypatch):
     )
     assert s.harness_stall_seconds == 12
     assert s.harness_heartbeat_minutes == [5, 10]
+
+
+# Ported from tests/unit/test_bot/test_core_proxy.py (old bot/core.py helper).
+@pytest.mark.parametrize(
+    "url, expected",
+    [
+        (
+            "http://alice:s3cret@proxy.internal:3128",
+            "http://alice:***@proxy.internal:3128",
+        ),
+        ("https://svc-bot:hunter2@10.0.0.9:8080", "https://svc-bot:***@10.0.0.9:8080"),
+        ("http://proxy.internal:3128", "http://proxy.internal:3128"),
+        ("http://alice@proxy.internal:3128", "http://alice@proxy.internal:3128"),
+        # rpartition on "@" splits on the userinfo separator, not the password.
+        (
+            "http://alice:p@ss@proxy.internal:3128",
+            "http://alice:***@proxy.internal:3128",
+        ),
+        # A URL we cannot parse must never be logged verbatim.
+        ("http://[::1", "<unparsable proxy URL>"),
+    ],
+)
+def test_redact_proxy_url(url, expected):
+    assert redact_proxy_url(url) == expected

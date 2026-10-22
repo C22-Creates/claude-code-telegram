@@ -1,5 +1,7 @@
 """Small formatting helpers for harness output."""
 
+from urllib.parse import urlparse, urlunparse
+
 from src.harness.types import Outcome, RunResult
 
 
@@ -19,3 +21,16 @@ def footer(result: RunResult) -> str:
         return f"⚠️ stopped ({result.reason}) · {elapsed}"
     first_line = result.reason.splitlines()[0] if result.reason.strip() else ""
     return f"❌ error: {first_line}"
+
+
+def redact_proxy_url(proxy_url: str) -> str:
+    """Mask a proxy URL's password so it is safe to log."""
+    try:
+        parsed = urlparse(proxy_url)
+    except ValueError:
+        return "<unparsable proxy URL>"
+    if not parsed.password:
+        return proxy_url
+    userinfo, _, hostport = parsed.netloc.rpartition("@")
+    username = userinfo.split(":", 1)[0]
+    return urlunparse(parsed._replace(netloc=f"{username}:***@{hostport}"))

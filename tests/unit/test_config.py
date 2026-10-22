@@ -47,36 +47,6 @@ def test_settings_with_valid_data(tmp_path):
     assert settings.approved_directory == test_dir
 
 
-def test_claude_tool_idle_timeout_defaults_below_session_timeout(tmp_path):
-    """The idle-stall watchdog default must actually be able to fire."""
-    settings = Settings(
-        telegram_bot_token="test_token",
-        telegram_bot_username="test_bot",
-        approved_directory=str(tmp_path),
-    )
-
-    assert settings.claude_tool_idle_timeout_seconds < settings.claude_timeout_seconds
-
-
-def test_claude_tool_idle_timeout_clamped_when_not_below_session_timeout(tmp_path):
-    """An idle timeout >= the session timeout could never fire — clamp it.
-
-    Regression guard for failure mode #39's fix: a config that only shortens
-    claude_timeout_seconds (a common pattern in fast test/dev configs)
-    must not silently leave the watchdog permanently unable to trigger.
-    """
-    settings = Settings(
-        telegram_bot_token="test_token",
-        telegram_bot_username="test_bot",
-        approved_directory=str(tmp_path),
-        claude_timeout_seconds=5,
-        claude_tool_idle_timeout_seconds=120,
-    )
-
-    assert settings.claude_tool_idle_timeout_seconds < settings.claude_timeout_seconds
-    assert settings.claude_tool_idle_timeout_seconds == 4
-
-
 def test_allowed_users_parsing():
     """Test parsing of comma-separated user IDs."""
     with tempfile.TemporaryDirectory() as tmp_dir:
@@ -590,42 +560,32 @@ def test_computed_properties(tmp_path):
     assert sqlite_settings.database_path == Path("data/bot.db").resolve()
 
 
-def test_feature_flags():
+def test_feature_flags(tmp_path):
     """Test feature flag system."""
-    # Create test MCP config file with valid structure before creating settings
-    mcp_config = (
+    mcp_config = tmp_path / "mcp.json"
+    mcp_config.write_text(
         '{"mcpServers": {"test-server": {"command": "echo", "args": ["hello"]}}}'
     )
-    Path("/tmp/test_mcp.json").write_text(mcp_config)
 
     settings = create_test_config(
         enable_mcp=True,
-        mcp_config_path="/tmp/test_mcp.json",
-        enable_git_integration=True,
-        enable_file_uploads=False,
-        enable_token_auth=True,
-        auth_token_secret="secret",
+        mcp_config_path=str(mcp_config),
+        enable_scheduler=True,
+        enable_dispatcher=False,
+        enable_voice_messages=True,
+        voice_provider="openai",
     )
 
     features = FeatureFlags(settings)
 
     assert features.mcp_enabled is True
-    assert features.git_enabled is True
-    assert features.file_uploads_enabled is False
-    assert features.token_auth_enabled is True
+    assert features.scheduler_enabled is True
+    assert features.dispatcher_enabled is False
+    assert features.voice_messages_enabled is False  # no OPENAI_API_KEY
 
-    enabled_features = features.get_enabled_features()
-    assert "mcp" in enabled_features
-    assert "git" in enabled_features
-    assert "file_uploads" not in enabled_features
-    assert "token_auth" in enabled_features
-
-    # Test generic feature check
-    assert features.is_feature_enabled("git") is True
+    assert features.get_enabled_features() == ["mcp", "scheduler"]
+    assert features.is_feature_enabled("scheduler") is True
     assert features.is_feature_enabled("nonexistent") is False
-
-    # Cleanup test file
-    Path("/tmp/test_mcp.json").unlink(missing_ok=True)
 
 
 def test_environment_loading():
@@ -728,3 +688,88 @@ def test_configuration_error_handling():
                 "APPROVED_DIRECTORY",
             ]:
                 os.environ.pop(key, None)
+
+
+# Variable NAMES in the production .env (/home/c22bot/c22os-telegram/.env) when
+# the harness replaced the old bot/claude stack. Some (USE_SDK, AGENTIC_MODE,
+# ENABLE_STREAM_DRAFTS, ENABLE_API_SERVER, VERBOSE_LEVEL, REPLY_QUOTE, ...) no
+# longer mean anything; the settings model must still load with all of them.
+PRODUCTION_ENV_NAMES = [
+    "TELEGRAM_BOT_TOKEN",
+    "TELEGRAM_BOT_USERNAME",
+    "ENABLE_PROJECT_THREADS",
+    "PROJECT_THREADS_MODE",
+    "PROJECT_THREADS_CHAT_ID",
+    "PROJECTS_CONFIG_PATH",
+    "APPROVED_DIRECTORY",
+    "ALLOWED_USERS",
+    "USE_SDK",
+    "AGENTIC_MODE",
+    "CLAUDE_MAX_TURNS",
+    "CLAUDE_TIMEOUT_SECONDS",
+    "CLAUDE_MAX_COST_PER_USER",
+    "CLAUDE_MAX_COST_PER_REQUEST",
+    "DISABLE_TOOL_VALIDATION",
+    "ENABLE_MCP",
+    "MCP_CONFIG_PATH",
+    "ENABLE_SCHEDULER",
+    "NOTIFICATION_CHAT_IDS",
+    "DATABASE_URL",
+    "SESSION_TIMEOUT_HOURS",
+    "ENABLE_API_SERVER",
+    "ENABLE_VOICE_MESSAGES",
+    "VOICE_PROVIDER",
+    "WHISPER_CPP_BINARY_PATH",
+    "WHISPER_CPP_MODEL_PATH",
+    "OPENAI_API_KEY",
+    "ENABLE_STREAM_DRAFTS",
+    "VERBOSE_LEVEL",
+    "REPLY_QUOTE",
+    "DISABLE_SECURITY_PATTERNS",
+    "SANDBOX_ENABLED",
+    "ENABLE_DISPATCHER",
+    "DISPATCHER_TICK_SECONDS",
+    "ENABLE_CLAUDEAI_MCP_SERVERS",
+]
+
+
+def test_production_env_names_still_load(tmp_path, monkeypatch):
+    projects = tmp_path / "projects.yaml"
+    projects.write_text("projects: []\n")
+    mcp = tmp_path / "mcp.json"
+    mcp.write_text('{"mcpServers": {"x": {"command": "echo"}}}')
+    special = {
+        "PROJECT_THREADS_MODE": "group",
+        "PROJECT_THREADS_CHAT_ID": "-1001",
+        "PROJECTS_CONFIG_PATH": str(projects),
+        "APPROVED_DIRECTORY": str(tmp_path),
+        "ALLOWED_USERS": "1,2",
+        "NOTIFICATION_CHAT_IDS": "-1001",
+        "MCP_CONFIG_PATH": str(mcp),
+        "DATABASE_URL": f"sqlite:///{tmp_path / 'bot.db'}",
+        "VOICE_PROVIDER": "local",
+        "WHISPER_CPP_BINARY_PATH": "/usr/bin/whisper",
+        "WHISPER_CPP_MODEL_PATH": "base",
+        "OPENAI_API_KEY": "dummy",
+        "TELEGRAM_BOT_TOKEN": "123:abc",
+        "TELEGRAM_BOT_USERNAME": "bot",
+        "VERBOSE_LEVEL": "1",
+    }
+    numeric = {
+        "CLAUDE_MAX_TURNS": "50",
+        "CLAUDE_TIMEOUT_SECONDS": "600",
+        "CLAUDE_MAX_COST_PER_USER": "10",
+        "CLAUDE_MAX_COST_PER_REQUEST": "5",
+        "SESSION_TIMEOUT_HOURS": "24",
+        "DISPATCHER_TICK_SECONDS": "60",
+    }
+    for name in PRODUCTION_ENV_NAMES:
+        monkeypatch.setenv(name, special.get(name) or numeric.get(name) or "true")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.enable_project_threads is True
+    assert settings.project_threads_chat_id == -1001
+    assert settings.allowed_users == [1, 2]
+    assert settings.enable_dispatcher is True
+    assert settings.harness_concurrency_cap == 3
