@@ -129,7 +129,7 @@ def _settings(max_words=300):
 
 
 def _fake_query(messages=None, exc=None, calls=None):
-    async def fake(*, prompt, options):
+    async def fake(*, prompt, options, transport=None):
         if calls is not None:
             calls.append((prompt, options))
         if exc:
@@ -194,7 +194,7 @@ async def test_carryover_error_returns_empty():
 
 
 async def test_carryover_timeout_returns_empty():
-    async def hang(*, prompt, options):
+    async def hang(*, prompt, options, transport=None):
         await asyncio.sleep(10)
         yield _result("never")
 
@@ -202,3 +202,62 @@ async def test_carryover_timeout_returns_empty():
         "s1", Path("/w"), _settings(), query_fn=hang, timeout=0.01
     )
     assert out == ""
+
+
+async def test_carryover_passes_reachable_transport():
+    seen = []
+
+    async def fake(*, prompt, options, transport=None):
+        seen.append(transport)
+        yield _result("ok")
+
+    made = []
+
+    def factory(prompt, options):
+        made.append((prompt, options))
+        return "T"
+
+    out = await summarize_for_carryover(
+        "s1", Path("/w"), _settings(), query_fn=fake, transport_factory=factory
+    )
+    assert out == "ok" and seen == ["T"]
+    assert made[0][0] == CARRYOVER_PROMPT and made[0][1].resume == "s1"
+
+
+async def test_carryover_ignoring_cancellation_returns_promptly_and_reaps(
+    monkeypatch,
+):
+    import time
+
+    from src.harness import carryover
+
+    reaped = []
+    monkeypatch.setattr(
+        carryover,
+        "reap_wedged_child",
+        lambda client, reason: reaped.append((client._transport, reason)),
+    )
+    release = asyncio.Event()
+
+    async def stubborn(*, prompt, options, transport=None):
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            await release.wait()  # swallows the first cancel (wedged child)
+        yield _result("never")
+
+    transport = object()
+    started = time.monotonic()
+    out = await summarize_for_carryover(
+        "s1",
+        Path("/w"),
+        _settings(),
+        query_fn=stubborn,
+        timeout=0.05,
+        close_timeout=0.05,
+        transport_factory=lambda prompt, options: transport,
+    )
+    assert out == ""
+    assert time.monotonic() - started < 0.5  # timeout + close bound, not forever
+    assert reaped == [(transport, "carryover_timeout")]
+    release.set()

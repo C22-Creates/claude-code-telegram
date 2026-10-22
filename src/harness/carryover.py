@@ -2,6 +2,7 @@
 
 import asyncio
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, AsyncIterator, Callable, Optional
 
 import structlog
@@ -12,6 +13,10 @@ from claude_agent_sdk import (
     TextBlock,
     query,
 )
+from claude_agent_sdk._internal.transport.subprocess_cli import SubprocessCLITransport
+
+from src.harness.run_support import bounded
+from src.harness.sdk_lifecycle import await_cancelled, reap_wedged_child
 
 logger = structlog.get_logger()
 
@@ -20,14 +25,16 @@ CARRYOVER_PROMPT = (
     "open tasks, decisions, names, IDs."
 )
 CARRYOVER_TIMEOUT_SECONDS = 120.0
+CARRYOVER_CLOSE_TIMEOUT_SECONDS = 2.0
 
 QueryFn = Callable[..., AsyncIterator[Any]]
+TransportFactory = Callable[..., Any]
 
 
-async def _collect(query_fn: QueryFn, options: ClaudeAgentOptions) -> str:
+async def _collect(stream: AsyncIterator[Any]) -> str:
     last_text = ""
     result: Optional[str] = None
-    async for message in query_fn(prompt=CARRYOVER_PROMPT, options=options):
+    async for message in stream:
         if isinstance(message, AssistantMessage):
             text = "".join(b.text for b in message.content if isinstance(b, TextBlock))
             if text:
@@ -43,11 +50,21 @@ async def summarize_for_carryover(
     settings: Any,
     query_fn: QueryFn = query,
     timeout: float = CARRYOVER_TIMEOUT_SECONDS,
+    *,
+    close_timeout: float = CARRYOVER_CLOSE_TIMEOUT_SECONDS,
+    transport_factory: TransportFactory = SubprocessCLITransport,
 ) -> str:
     """Summarize ``session_id`` via a forked one-shot query; "" on any failure.
 
     ``fork_session=True`` keeps the old session untouched. Rotation proceeds
     without a summary rather than failing the user's message.
+
+    This runs inside the topic's run slot before any watchdog, so it must
+    return within ``timeout + 2 * close_timeout`` whatever the CLI does: a
+    timeout cancels the query without waiting on the cancellation beyond a
+    bound (a wedged child can swallow it, as on 2026-07-29), closes the stream
+    (bounded) and reaps the CLI child, which is reachable because the
+    transport is built here rather than inside ``query()``.
     """
     options = ClaudeAgentOptions(
         resume=session_id,
@@ -61,12 +78,49 @@ async def summarize_for_carryover(
         cwd=str(cwd),
         setting_sources=[],
     )
+    transport: Any = None
     try:
-        text = await asyncio.wait_for(_collect(query_fn, options), timeout)
+        transport = transport_factory(prompt=CARRYOVER_PROMPT, options=options)
+        stream = query_fn(prompt=CARRYOVER_PROMPT, options=options, transport=transport)
+        task = asyncio.ensure_future(_collect(stream))
     except Exception as exc:  # noqa: BLE001 - any failure degrades to ""
         logger.warning(
             "Carry-over summary failed", session_id=session_id, error=repr(exc)
         )
         return ""
-    words = text.split()
+    try:
+        done, _ = await asyncio.wait({task}, timeout=timeout)
+    except BaseException:  # caller cancelled: do not leave the query running
+        task.cancel()
+        raise
+    if not done:
+        logger.warning("Carry-over summary timed out", session_id=session_id)
+        await _abandon(task, stream, transport, close_timeout)
+        return ""
+    if task.exception() is not None:
+        logger.warning(
+            "Carry-over summary failed",
+            session_id=session_id,
+            error=repr(task.exception()),
+        )
+        return ""
+    words = task.result().split()
     return " ".join(words[: settings.harness_carryover_max_words])
+
+
+async def _abandon(
+    task: "asyncio.Future[str]",
+    stream: AsyncIterator[Any],
+    transport: Any,
+    close_timeout: float,
+) -> None:
+    """Cancel, close and reap a timed-out summary; every wait is bounded."""
+    task.cancel()
+    if await await_cancelled(task, "carryover_timeout", close_timeout):
+        # ``async for`` does not close its iterator on cancellation (PEP 533):
+        # aclose() runs the SDK's own cleanup, which terminates the CLI.
+        aclose = getattr(stream, "aclose", None)
+        if aclose is not None:
+            await bounded(aclose(), close_timeout, "carryover_aclose")
+    # A no-op when the child already exited; else SIGKILL it and its MCPs.
+    reap_wedged_child(SimpleNamespace(_transport=transport), "carryover_timeout")
