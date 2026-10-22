@@ -12,6 +12,8 @@ propagate the caller's own cancellation). Three tasks cooperate:
 """
 
 import asyncio
+import collections
+import dataclasses
 import time
 from typing import Any, Awaitable, Callable
 
@@ -37,12 +39,15 @@ from src.harness.sdk_lifecycle import (
     turn_signal,
 )
 from src.harness.types import Outcome, ProgressEvent, RunResult
+from src.harness.util import stall_reason
 
 logger = structlog.get_logger()
 
 INTERRUPT_TIMEOUT = 10.0  # the spike measured ~0.05s; 10s means wedged
 PROGRESS_TIMEOUT = 10.0  # a hung Telegram call must not freeze the run
 UNAVAILABLE_MCP_STATUSES = ("failed", "needs-auth")
+TICK_EVENT_SECONDS = 60.0  # keeps the status visibly moving (spec §2)
+STDERR_TAIL_LINES = 20
 
 
 class AgentRun:
@@ -68,6 +73,11 @@ class AgentRun:
         cleanup_timeout: float = CANCELLED_TASK_CLEANUP_TIMEOUT,
         progress_timeout: float = PROGRESS_TIMEOUT,
     ) -> None:
+        # The CLI's stderr is only useful when a run fails: keep a tail per run
+        # (still forwarding to any callback the options came with).
+        self._stderr_tail: collections.deque[str] = collections.deque(
+            maxlen=STDERR_TAIL_LINES
+        )
         self._options = options
         self._on_progress = on_progress
         self._settings = settings
@@ -99,6 +109,7 @@ class AgentRun:
             raise RuntimeError("AgentRun is already running")
         self._active = True
         self._reset_run()
+        self._stderr_tail.clear()
         self._started_at = self._clock()
         self._queries_sent = 1  # the prompt; a retry's re-send is not counted
         try:
@@ -127,6 +138,7 @@ class AgentRun:
             reason=self._reason,
             session_id=self.session_id,
             tool_calls=self._tool_calls,
+            events_seen=self._events_seen,
         )
         self._log_end(result.outcome.value, result.reason)
         return result
@@ -197,6 +209,7 @@ class AgentRun:
         self._finished = asyncio.Event()
         self._outcome: Outcome | None = None
         self._reason = ""
+        self._events_seen = 0
 
     def _reset_attempt(self) -> None:
         self._finished = asyncio.Event()
@@ -233,7 +246,7 @@ class AgentRun:
     async def _attempt(self, prompt: Prompt) -> None:
         client = reader = supervisor = None
         try:
-            client = self._client_factory(self._options)
+            client = self._client_factory(self._with_stderr_tail(self._options))
             if not await self._start(client, prompt):
                 return
             self._last_event_at = self._clock()
@@ -322,7 +335,11 @@ class AgentRun:
         if client is not None:
             if self._wedged or not settled:
                 reap_wedged_child(client, reason)
-            await bounded(client.disconnect(), self._cleanup_timeout, "disconnect")
+            if not await bounded(
+                client.disconnect(), self._cleanup_timeout, "disconnect"
+            ):
+                # A hung disconnect would leak the CLI and its MCP children.
+                reap_wedged_child(client, "disconnect_timeout")
 
     # ---------------------------------------------------------------- reader
 
@@ -383,6 +400,10 @@ class AgentRun:
 
     def _on_result(self, message: ResultMessage) -> None:
         self.session_id = message.session_id or self.session_id
+        if self._finished.is_set():
+            # A late result after the end-turn grace already closed the answer:
+            # recording it again would deliver the answer twice.
+            return
         if not message.is_error:
             self._close_answer(message.result)
         if self._interrupt_sent:
@@ -421,16 +442,24 @@ class AgentRun:
         s = self._settings
         marks = sorted(m * 60 for m in s.harness_heartbeat_minutes)
         cap = s.harness_run_cap_seconds
+        last_tick = self._started_at
         while not self._finished.is_set() and self._stop_reason is None:
             await self._sleep(self._tick)
             now = self._clock()
             while marks and now - self._started_at >= marks[0]:
                 await self._emit("heartbeat", detail=f"{marks.pop(0) // 60}m")
+            if now - last_tick >= TICK_EVENT_SECONDS:
+                last_tick = now
+                await self._emit("tick")
             idle = now - self._last_event_at
             if now - self._started_at >= cap:
                 await self.interrupt(f"hit {round(cap / 60)}m cap")
             elif not self._paused and idle >= s.harness_stall_seconds:
-                await self.interrupt(f"stalled on {self._last_tool or 'unknown'}")
+                reason = stall_reason(self._last_tool, s.harness_stall_seconds)
+                # Visible before the (bounded, but seconds-long) interrupt and
+                # teardown, so the screen never sits unchanged past the stall.
+                await self._emit("stalling", tool=self._last_tool, detail=reason)
+                await self.interrupt(reason)
             elif (
                 self._turn_ended
                 and self._pending_injections == 0
@@ -457,6 +486,17 @@ class AgentRun:
             self._on_progress(event), self._progress_timeout, f"on_progress:{kind}"
         )
 
+    def _with_stderr_tail(self, options: ClaudeAgentOptions) -> ClaudeAgentOptions:
+        """A copy of *options* whose stderr also feeds this run's tail buffer."""
+        forward = options.stderr
+
+        def on_stderr(line: str) -> None:
+            self._stderr_tail.append(line)
+            if forward is not None:
+                forward(line)
+
+        return dataclasses.replace(options, stderr=on_stderr)
+
     def _log_event(self, message: Any, now: float) -> None:
         tool = None
         if isinstance(message, AssistantMessage):
@@ -482,12 +522,18 @@ class AgentRun:
         )
 
     def _log_end(self, outcome: str, reason: str) -> None:
-        logger.info(
-            "harness.run_end",
-            outcome=outcome,
-            reason=reason,
-            elapsed_s=round(self._elapsed(), 3),
-            tool_calls=self._tool_calls,
-            queries_sent=self._queries_sent,
-            session_id=self.session_id,
+        fields: dict[str, Any] = {
+            "outcome": outcome,
+            "reason": reason,
+            "elapsed_s": round(self._elapsed(), 3),
+            "tool_calls": self._tool_calls,
+            "queries_sent": self._queries_sent,
+            "session_id": self.session_id,
+        }
+        if outcome != Outcome.ERROR.value:
+            logger.info("harness.run_end", **fields)
+            return
+        # The CLI's last words are usually the only clue to why it died.
+        logger.error(
+            "harness.run_end", stderr_tail="\n".join(self._stderr_tail), **fields
         )

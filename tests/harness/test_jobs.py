@@ -112,8 +112,11 @@ async def test_outcome_text_variants():
         return RunResult(outcome=outcome, text=body, elapsed_s=5, reason=reason)
 
     assert outcome_text(r(Outcome.DONE, "all good")) == "all good"
-    assert outcome_text(r(Outcome.STOPPED, "part", "stalled on X")) == (
-        "part\n\n⚠️ stopped (stalled on X) · 5s"
+    assert outcome_text(r(Outcome.STOPPED, "part", "cancelled")) == (
+        "part\n\n⚠️ stopped (cancelled) · 5s"
+    )
+    assert outcome_text(r(Outcome.STOPPED, "part", "stalled on X for 5m")) == (
+        "part\n\n⚠️ stalled on X for 5m, stopped. Reply to retry."
     )
     assert outcome_text(r(Outcome.ERROR, "", "boom")) == "❌ error: boom"
 

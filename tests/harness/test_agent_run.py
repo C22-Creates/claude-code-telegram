@@ -123,7 +123,7 @@ async def test_stall_interrupts_after_5m_keeps_session(settings):
     )
     res = await h.run.run("inbox?")
     assert res.outcome is Outcome.STOPPED
-    assert res.reason == "stalled on mcp__missive__list_conversations"
+    assert res.reason == "stalled on mcp__missive__list_conversations for 5m"
     assert h.client.interrupted == 1
     assert res.session_id == "sess-1"  # from the post-interrupt ResultMessage
     assert res.text == "Looking now."
@@ -249,7 +249,7 @@ async def test_unconsumed_injection_still_bounded_by_stall(settings):
     holder["run"] = h.run
     res = await h.run.run("q")
     assert res.outcome is Outcome.STOPPED
-    assert res.reason == "stalled on unknown"
+    assert res.reason == "stalled on unknown for 5m"
 
 
 async def test_interrupt_hang_reaps_child(settings, monkeypatch):
@@ -408,7 +408,7 @@ async def test_watchdog_paused_while_waiting_then_restarts(settings):
     holder.update(run=h.run, clock=h.clock)
     res = await h.run.run("x")
     assert res.outcome is Outcome.STOPPED
-    assert res.reason == "stalled on AskUserQuestion"
+    assert res.reason == "stalled on AskUserQuestion for 5m"
     # Stall clock restarted from the answer at 12m, not from the tool call.
     assert 1020 <= res.elapsed_s <= 1035
 
@@ -570,7 +570,7 @@ async def test_hung_progress_callback_does_not_freeze_watchdog(settings):
     )
     # The heartbeat at 1m hangs in the supervisor; the stall must still fire.
     res = await asyncio.wait_for(h.run.run("q"), 5)
-    assert (res.outcome, res.reason) == (Outcome.STOPPED, "stalled on X")
+    assert (res.outcome, res.reason) == (Outcome.STOPPED, "stalled on X for 5m")
 
 
 async def test_inject_during_connect_is_buffered_after_prompt(settings):
@@ -625,3 +625,195 @@ async def test_elapsed_s_counts_while_running_and_is_zero_after(settings):
     await h.run.run("hi")
     assert seen and max(seen) >= 240
     assert h.run.elapsed_s == 0.0
+
+
+# ------------------------------------------------- final-review fixes (I1-I5, M2)
+
+
+def delta(at: float = 0) -> tuple:
+    """An invisible stream event (token delta): resets the stall clock only."""
+    from claude_agent_sdk.types import StreamEvent
+
+    return (
+        at,
+        StreamEvent(
+            uuid="u-d",
+            session_id="sess-1",
+            event={"type": "content_block_delta"},
+            parent_tool_use_id=None,
+        ),
+    )
+
+
+class StatusBot(fakes.FakeBot):
+    """FakeBot that stamps each status edit with fake time and client state."""
+
+    def __init__(self, clock, client_ref) -> None:
+        super().__init__()
+        self.clock = clock
+        self.client_ref = client_ref
+        self.edits: list[tuple[float, str, bool]] = []
+
+    async def edit_message_text(self, **kwargs):
+        self.edits.append(
+            (self.clock.now, kwargs["text"], self.client_ref().disconnected)
+        )
+        return await super().edit_message_text(**kwargs)
+
+
+def with_status(h: "Harness", settings):
+    """Feed the run's progress into a real StatusMessage on a StatusBot."""
+    from src.harness.status_message import StatusMessage
+
+    bot = StatusBot(h.clock, lambda: h.client)
+    status = StatusMessage(bot, 1, None, 9, settings, h.clock, sleep=h.clock.wait)
+
+    async def both(event: ProgressEvent) -> None:
+        h.events.append(event)
+        await status.update(event)
+
+    h.run._on_progress = both
+    return status, bot
+
+
+async def test_supervisor_emits_tick_every_60s(settings):
+    h = Harness(
+        [(0, fakes.message_start()), delta(240), delta(240), (0, fakes.result())],
+        settings,
+    )
+    res = await h.run.run("q")
+    assert res.outcome is Outcome.DONE
+    ticks = [round(e.elapsed_s) for e in h.kinds("tick")]
+    assert len(ticks) == 8 and all(b - a == 60 for a, b in zip(ticks, ticks[1:]))
+
+
+async def test_invisible_events_still_change_status_every_5m(settings):
+    h = Harness(
+        [(0, fakes.message_start()), *[delta(150) for _ in range(4)]]
+        + [(0, fakes.result(text="fin"))],
+        settings,
+    )
+    status, bot = with_status(h, settings)
+    await status.open("⚙️ starting")
+    res = await h.run.run("q")
+    assert res.outcome is Outcome.DONE and res.elapsed_s >= 600
+    times = [0.0, *[t for t, _, _ in bot.edits], res.elapsed_s]
+    assert max(b - a for a, b in zip(times, times[1:])) <= 300
+
+
+async def test_stall_shows_stalling_note_before_teardown(settings):
+    h = Harness([(0, fakes.message_start()), (0, fakes.tool_use("Bash"))], settings)
+    status, bot = with_status(h, settings)
+    await status.open("⚙️ starting")
+    res = await h.run.run("q")
+    assert res.reason == "stalled on Bash for 5m"
+    notes = [e for e in bot.edits if "stalled on Bash for 5m, stopping…" in e[1]]
+    assert notes, bot.edits
+    at, _, disconnected = notes[0]
+    last_event = h.kinds("tool")[-1].elapsed_s  # fake time drifts a few ticks
+    assert at - last_event <= 301
+    assert not disconnected  # visible before teardown completes
+    await status.finish(res)
+    assert bot.edits[-1][1] == ("⚠️ stalled on Bash for 5m, stopped. Reply to retry.")
+
+
+async def test_late_result_after_grace_done_not_appended_twice(settings):
+    holder: dict = {}
+
+    async def wait_finished() -> None:
+        while not holder["run"]._finished.is_set():
+            await asyncio.sleep(0)
+
+    h = Harness(
+        [
+            (0, fakes.message_start()),
+            (0, fakes.text("Answer.")),
+            (0, fakes.message_delta_end_turn()),
+            ("call", wait_finished),
+            (0, fakes.result(text="Answer.")),
+        ],
+        settings,
+    )
+    holder["run"] = h.run
+    original = h.run._on_result
+    late: list = []
+
+    def spy(message):
+        late.append(h.run._finished.is_set())
+        original(message)
+
+    h.run._on_result = spy
+    res = await h.run.run("q")
+    assert res.outcome is Outcome.DONE
+    assert res.text == "Answer."
+    assert late == [True]  # the late ResultMessage really was processed
+
+
+class HangDisconnectClient(FakeSDKClient):
+    async def disconnect(self) -> None:
+        self.disconnected = True
+        self._closed_evt.set()
+        await asyncio.Event().wait()
+
+
+async def test_disconnect_timeout_reaps_child(settings, monkeypatch):
+    reaped: list = []
+    monkeypatch.setattr(
+        agent_run_module,
+        "reap_wedged_child",
+        lambda client, reason: reaped.append((client, reason)),
+    )
+    h = Harness(
+        [(0, fakes.message_start()), (0, fakes.result())],
+        settings,
+        client_cls=HangDisconnectClient,
+    )
+    res = await asyncio.wait_for(h.run.run("q"), 1)
+    assert res.outcome is Outcome.DONE
+    assert reaped == [(h.client, "disconnect_timeout")]
+
+
+async def test_error_outcome_logs_stderr_tail(settings):
+    from structlog.testing import capture_logs
+
+    seen: list[str] = []
+    holder: dict = {}
+
+    def spew() -> None:
+        for i in range(25):
+            holder["client"].options.stderr(f"line {i}")
+
+    h = Harness(
+        [
+            ("call", spew),
+            ("raise", CLIConnectionError("CLI exited 1")),
+        ],
+        settings,
+    )
+    holder["client"] = h.client
+    h.run._options = ClaudeAgentOptions(stderr=seen.append)
+    with capture_logs() as logs:
+        res = await h.run.run("q")
+    assert res.outcome is Outcome.ERROR
+    assert seen[-1] == "line 24"  # the caller's own callback still gets lines
+    end = [e for e in logs if e["event"] == "harness.run_end"]
+    assert end[-1]["log_level"] == "error"
+    assert end[-1]["stderr_tail"] == "\n".join(f"line {i}" for i in range(5, 25))
+
+
+async def test_done_outcome_run_end_has_no_stderr_tail(settings):
+    from structlog.testing import capture_logs
+
+    h = Harness([(0, fakes.message_start()), (0, fakes.result())], settings)
+    with capture_logs() as logs:
+        await h.run.run("q")
+    end = [e for e in logs if e["event"] == "harness.run_end"][-1]
+    assert end["log_level"] == "info" and "stderr_tail" not in end
+
+
+async def test_result_reports_events_seen(settings):
+    ok = Harness([(0, fakes.message_start()), (0, fakes.result())], settings)
+    assert (await ok.run.run("q")).events_seen == 2
+    dead = Harness([("raise", CLIConnectionError("No conversation found"))], settings)
+    res = await dead.run.run("q")
+    assert (res.outcome, res.events_seen) == (Outcome.ERROR, 0)

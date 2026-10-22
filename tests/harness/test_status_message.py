@@ -319,3 +319,27 @@ def test_split_message_prefers_newlines():
     parts = split_message("aaa\nbbb\nccc", limit=8)
     assert parts == ["aaa\nbbb", "ccc"]
     assert split_message("x" * 10, limit=4) == ["xxxx", "xxxx", "xx"]
+
+
+async def test_tick_rerenders_elapsed():
+    sm, bot, clock = make()
+    await sm.open("start")
+    await sm.update(ev(tool="Bash", elapsed=3))
+    await settle()
+    clock.now = 60
+    await sm.update(ev(kind="tick", tool=None, elapsed=60))
+    await settle()
+    texts = [kw["text"] for kw in bot.calls_for("edit_message_text")]
+    assert texts[-1] == "🔧 Bash · turn 1 · 1m0s"
+
+
+async def test_stalling_edits_immediately():
+    sm, bot, clock = make()
+    await sm.open("start")
+    await sm.update(ev(tool="Bash", elapsed=3))
+    await settle()
+    clock.now = 6  # inside the coalescing interval of the next edit
+    reason = "stalled on Bash for 5m"
+    await sm.update(ev(kind="stalling", tool="Bash", elapsed=303, detail=reason))
+    texts = [kw["text"] for kw in bot.calls_for("edit_message_text")]
+    assert texts[-1] == ("🔧 Bash · turn 1 · 5m3s\n⚠️ stalled on Bash for 5m, stopping…")

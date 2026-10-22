@@ -4,7 +4,7 @@ import pytest
 
 from src.config.settings import Settings
 from src.harness.types import Outcome, RunResult
-from src.harness.util import fmt_elapsed, footer, redact_proxy_url
+from src.harness.util import fmt_elapsed, footer, redact_proxy_url, stall_reason
 
 
 def test_fmt_elapsed():
@@ -24,6 +24,18 @@ def test_footer_done():
 
 def test_footer_stopped():
     assert footer(_r(Outcome.STOPPED, "stalled", 42)) == "⚠️ stopped (stalled) · 42s"
+    assert footer(_r(Outcome.STOPPED, "cancelled", 42)) == (
+        "⚠️ stopped (cancelled) · 42s"
+    )
+
+
+def test_footer_stall_uses_spec_copy():
+    reason = stall_reason("mcp__missive__x", 300)
+    assert reason == "stalled on mcp__missive__x for 5m"
+    assert footer(_r(Outcome.STOPPED, reason, 301)) == (
+        "⚠️ stalled on mcp__missive__x for 5m, stopped. Reply to retry."
+    )
+    assert stall_reason(None, 90) == "stalled on unknown for 1m30s"
 
 
 def test_footer_error_uses_first_line_only():

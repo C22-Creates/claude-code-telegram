@@ -37,7 +37,12 @@ class Inbound:
 class ProgressEvent:
     """A unit of visible progress emitted by a run."""
 
-    kind: Literal["tool", "text", "turn", "heartbeat", "mcp_unavailable"]
+    # "tick": once a minute so the elapsed time on screen keeps moving even
+    # when the SDK only emits invisible events; "stalling": the watchdog fired
+    # and the run is being stopped (``detail`` is the stall reason).
+    kind: Literal[
+        "tool", "text", "turn", "heartbeat", "mcp_unavailable", "tick", "stalling"
+    ]
     tool: str | None
     turn: int
     elapsed_s: float
@@ -56,8 +61,10 @@ class Outcome(Enum):
 class RunResult:
     """Final result of a run.
 
-    ``reason`` explains STOPPED/ERROR and is empty for DONE. Callers should use
-    keyword arguments.
+    ``reason`` explains STOPPED/ERROR and is empty for DONE. ``events_seen``
+    counts SDK messages read in the final attempt: 0 on an ERROR means the CLI
+    died before saying anything (e.g. an unresumable session). Callers should
+    use keyword arguments.
     """
 
     outcome: Outcome
@@ -66,3 +73,4 @@ class RunResult:
     reason: str = ""
     session_id: str | None = None
     tool_calls: int = 0
+    events_seen: int = 0

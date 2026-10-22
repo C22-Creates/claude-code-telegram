@@ -285,7 +285,7 @@ async def test_watchdog_paused_while_question_pending(settings, bot):
     holder["run"] = run
     res = await run.run("x")
     assert res.outcome is Outcome.STOPPED
-    assert res.reason == "stalled on AskUserQuestion"
+    assert res.reason == "stalled on AskUserQuestion for 5m"
     # Stalled 5 minutes after the answer, not 5 minutes after the ask.
     assert holder["answered_at"] >= 720
     assert 300 <= res.elapsed_s - holder["answered_at"] <= 315

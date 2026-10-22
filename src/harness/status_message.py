@@ -7,8 +7,10 @@ Status text (plain, no parse_mode), top to bottom, empty parts omitted::
     working · turn {n} · {elapsed}          instead, before any tool event
     ⚠️ {server} unavailable                 one line per mcp_unavailable
     still working · {n}m                    latest heartbeat
+    ⚠️ {stall reason}, stopping…            once the stall watchdog fires
 
-A note is shown until the next "tool" event (real progress) or the next note.
+"tick" events (once a minute) only refresh the elapsed time, so the screen
+keeps moving while the SDK emits nothing visible. A note is shown until the next "tool" event (real progress) or the next note.
 
 Edits are coalesced: ``update()`` only records state and arms a timer, so it
 returns at once (the run bounds each progress callback at 10s). At most one
@@ -111,6 +113,7 @@ class StatusMessage:
         self._elapsed = 0.0
         self._unavailable: list[str] = []
         self._heartbeat = ""
+        self._stalling = ""
         self._timer: asyncio.Task | None = None
         self._edit_lock = asyncio.Lock()
         self._closed = False
@@ -139,6 +142,12 @@ class StatusMessage:
                 self._unavailable = [*self._unavailable, ev.detail]
         elif ev.kind == "heartbeat":
             self._heartbeat = f"still working · {ev.detail}"
+        elif ev.kind == "stalling":
+            # Not coalesced: the run is about to be torn down, and the user
+            # must see why before the footer lands (bounded by the run).
+            self._stalling = f"⚠️ {ev.detail}, stopping…"
+            await self._edit(self._render())
+            return
         self._version += 1
         self._arm_timer()
 
@@ -170,6 +179,7 @@ class StatusMessage:
             f"🔧 {self._tool} · {head}" if self._tool else f"working · {head}",
             *[f"⚠️ {name} unavailable" for name in self._unavailable],
             self._heartbeat,
+            self._stalling,
         ]
         return "\n".join(line for line in lines if line)
 
