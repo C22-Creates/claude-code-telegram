@@ -52,3 +52,22 @@ edits coalesce at 5s, so ~5s is the floor). `contact-lookup` detected as a
 
 Targets (< 60s, <= 8 tools, contact-lookup used; gap <= 300s; explicit footer):
 all met in all 4 runs.
+
+Read-only enforcement re-run (inner `can_use_tool` allowlist: Skill/Read/Glob/Grep,
+read-named MCP tools, Bash limited to `gog` calendar/drive/docs/sheets reads, the
+contacts-index script and plain inspection commands; anything else denied and the
+test fails). One run each, all targets met, nothing denied:
+
+| Replay | Elapsed | Tool calls | contact-lookup | Max status gap | Footer |
+|---|---|---|---|---|---|
+| 10/17 McGovern lookup | 18.4s | 3 (Skill, Bash, notion-query-data-sources) | yes (Skill) | 5.0s | ✅ done · 18s |
+| 10/14 resumed multi-step | 34.4s | 6 (Bash) | n/a | 8.9s | ✅ done · 34s |
+
+Bash commands recorded: 10/17 `python3 scripts/contacts-lookup.py "McGovern"; echo ...;
+python3 scripts/contacts-lookup.py "Crystal"`. 10/14: four `gog calendar events <addr>
+--account <alias> --from 2026-10-22 --to 2026-10-23 --max 50 --json --results-only`
+(one per calendar), a `jq` filter, and `python3 scripts/contacts-lookup.py
+"ocean-ledger.com" 2>&1 | head -60`.
+
+Not reproduced: the 10/14 incident's long-resumed-context shape (a ~1.1 MB
+transcript); the replay resumes a one-line warm-up session.
