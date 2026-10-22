@@ -29,3 +29,8 @@ Run 1 and run 2 behaved identically.
 - The stream contains many `HookEventMessage`/`SystemMessage` items at startup (user hooks); the spike filters them.
 - `StreamEvent` `message_delta` with `stop_reason` `tool_use`/`end_turn` appears per model call, so it is not a turn boundary on its own. Only `ResultMessage` is.
 - `receive_messages()` stays open across turns, which is what the live-injection design needs. `receive_response()` would stop at the first ResultMessage.
+
+## (d) long can_use_tool delay (Task 7)
+- SDK source (`claude_agent_sdk/_internal/query.py`): inbound `can_use_tool` control requests are run as a spawned task (`_handle_control_request`) with no timeout; the only control-request timeouts are on requests the SDK sends to the CLI (`initialize` 60s, others 60s via `anyio.fail_after`). Nothing bounds how long our callback may take.
+- Live check (real CLI, `claude-haiku-4-5-20251001`, no MCP, scratch cwd): AskUserQuestion callback slept 120s before returning `PermissionResultAllow(updated_input={..., "answers": {q: "blue"}})`. Callback fired at 7.24s, returned at 127.31s; the tool_result arrived 0.2s later ("The user answered: ... = \"blue\""), the run continued and ended with one ResultMessage ("You chose Blue"). The answer round-trips after a 2-minute human delay.
+- Not tested beyond 120s; no hard CLI-side timeout was observed or found in the SDK. The bridge's own 30-minute expiry (`harness_ask_expiry_seconds=1800`) is the effective limit.
