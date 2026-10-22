@@ -235,3 +235,27 @@ async def test_close_beats_interrupt_and_step_when_simultaneous():
 
 def test_tool_use_ids_unique():
     assert fakes.tool_use("Bash").content[0].id != fakes.tool_use("Bash").content[0].id
+
+
+async def test_call_step_runs_between_messages_sync_or_async():
+    seen: list = []
+
+    async def acall() -> None:
+        seen.append(("async", len(got)))
+
+    got: list = []
+    c = FakeSDKClient(
+        [
+            (0, fakes.text("a")),
+            ("call", lambda: seen.append(("sync", len(got)))),
+            ("call", acall),
+            (0, fakes.text("b")),
+        ],
+        sleep=_no_sleep,
+    )
+    async for m in c.receive_messages():
+        got.append(m)
+        if len(got) == 2:
+            break
+    # Both calls ran after "a" was consumed and before "b" was yielded.
+    assert seen == [("sync", 1), ("async", 1)]

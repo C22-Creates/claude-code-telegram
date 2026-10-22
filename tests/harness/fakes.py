@@ -101,7 +101,10 @@ def system_init(mcp_servers: list[dict[str, str] | str] | None = None) -> System
 
 # ------------------------------------------------------------------ SDK client
 
-# (delay_s, message) | ("await_query",) | ("raise", exc)
+# (delay_s, message) | ("await_query",) | ("raise", exc) | ("call", fn)
+# ``("call", fn)`` runs ``fn()`` (awaited if it returns an awaitable) when the
+# step is reached -- after the consumer has processed every earlier message.
+# It lets a test act at an exact point in the stream (inject, pause, ...).
 ScriptStep = tuple
 
 
@@ -250,6 +253,13 @@ class FakeSDKClient:
                 continue
             if step[0] == "raise":
                 raise step[1]
+            if step[0] == "call":
+                steps.pop(0)
+                started = True
+                outcome = step[1]()
+                if inspect.isawaitable(outcome):
+                    await outcome
+                continue
             delay, message = step
             if delay and await self._wait(self._sleep(delay)) != "extra":
                 continue
