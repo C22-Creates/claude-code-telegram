@@ -71,3 +71,10 @@ python3 scripts/contacts-lookup.py "Crystal"`. 10/14: four `gog calendar events 
 
 Not reproduced: the 10/14 incident's long-resumed-context shape (a ~1.1 MB
 transcript); the replay resumes a one-line warm-up session.
+
+Gate caveats: the allowlist lives in `tests/live/read_only_gate.py` (deny by
+default, explicit MCP tool names, quote-aware Bash segment check; unit-tested in
+`tests/live/test_read_only_gate.py` against every recorded command above and a set
+of bypasses). A tool pre-approved by a skill's `allowed-tools` frontmatter would
+bypass `can_use_tool` (none of the c22 commands declare it today). The replays can
+read local files, including secrets, via cat/grep: read-only by design.

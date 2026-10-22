@@ -14,7 +14,6 @@ read from the live checkout (read-only reference, not copied into the repo).
 
 import json
 import os
-import re
 import time
 from pathlib import Path
 from typing import Any
@@ -37,6 +36,7 @@ from src.harness.types import Inbound, Outcome, RunResult
 from src.security.validators import SecurityValidator
 from src.storage.database import DatabaseManager
 from tests.harness.fakes import FakeBot
+from tests.live.read_only_gate import READ_ONLY_DENIAL, is_read_only
 
 pytestmark = [
     pytest.mark.live,
@@ -59,65 +59,7 @@ LOOKUP_MAX_TOOLS = 8
 MAX_STATUS_GAP_S = 300.0
 
 
-READ_ONLY_DENIAL = "live replay is read-only"
-SAFE_TOOLS = {
-    "Skill",
-    "Read",
-    "Glob",
-    "Grep",
-    "ToolSearch",
-    "TodoWrite",
-    "WebSearch",
-    "WebFetch",
-}
-MCP_READ_WORDS = ("search", "query", "list", "get", "fetch", "read")
-MCP_WRITE_WORDS = (
-    "create",
-    "send",
-    "update",
-    "delete",
-    "draft",
-    "post",
-    "move",
-    "add",
-    "remove",
-    "set",
-    "write",
-)
-# Read-only shell: every ;/&&/| segment must be a gog read, the contacts index
-# lookup, or a plain inspection command. No redirects (bar 2>&1), no
-# substitution.
-BASH_SEGMENT = re.compile(
-    r"^\s*(?:"
-    r"gog\b.*\b(?:calendar\s+(?:events|list|search)|drive\s+(?:search|ls|get)"
-    r"|docs\s+export|sheets\s+(?:get|read))\b"
-    r"|python3\s+scripts/contacts-lookup\.py\b"
-    r"|(?:cat|ls|jq|head|tail|grep|date|pwd|echo)\b"
-    r")"
-)
-BASH_UNSAFE = re.compile(r"`|\$\(|>|<|\bsudo\b")
-BASH_SPLIT = re.compile(r"&&|\|\||;|\|")
 INPUT_TRUNC = 200
-
-
-def is_read_only(tool: str, tool_input: dict[str, Any]) -> bool:
-    """Allowlist for the live replays; everything else is denied."""
-    if tool in SAFE_TOOLS:
-        return True
-    if tool.startswith("mcp__"):
-        name = tool.lower()
-        return any(w in name for w in MCP_READ_WORDS) and not any(
-            w in name.split("__", 2)[-1] for w in MCP_WRITE_WORDS
-        )
-    if tool == "Bash":
-        cmd = str(tool_input.get("command", ""))
-        cmd = cmd.replace("2>&1", "")
-        if BASH_UNSAFE.search(cmd):
-            return False
-        return all(
-            BASH_SEGMENT.match(seg) for seg in BASH_SPLIT.split(cmd) if seg.strip()
-        )
-    return False
 
 
 def _make_tap(seen: list[dict[str, Any]]):
