@@ -36,6 +36,8 @@ EXPIRED_NOTICE = "expired"
 EXPIRY_TEXT = "no answer, stopped"
 DENY_MESSAGE = "no answer"
 TYPE_PROMPT = "✍️ Type your answer"
+STOPPED_TEXT = "stopped"
+_STOPPED = object()  # future result: the run ended while the question was open
 
 
 @dataclass
@@ -48,10 +50,9 @@ class _Pending:
     message_id: int
     question: str
     options: list[str]
-    future: "asyncio.Future[str]" = field(
+    future: "asyncio.Future[Any]" = field(
         default_factory=lambda: asyncio.get_running_loop().create_future()
     )
-    awaiting_text: bool = False
 
 
 class AskBridge:
@@ -76,6 +77,7 @@ class AskBridge:
         self._by_id: dict[str, _Pending] = {}
         self._by_topic: dict[str, _Pending] = {}
         self._locks: dict[str, asyncio.Lock] = {}
+        self._generation: dict[str, int] = {}
 
     # ----------------------------------------------------------- public API
 
@@ -101,15 +103,35 @@ class AskBridge:
         pending.future.set_result(text)
         return True
 
+    async def cancel_topic(self, topic_key: str) -> None:
+        """Drop the topic's pending question because its run ended.
+
+        Does not rely on the SDK cancelling the in-flight callback: the pending
+        state is removed here, the callback is woken with a stop marker, and a
+        generation bump makes asks queued behind it deny instead of sending.
+        """
+        self._generation[topic_key] = self._generation.get(topic_key, 0) + 1
+        pending = self._by_topic.pop(topic_key, None)
+        if pending is None:
+            return
+        self._by_id.pop(pending.ask_id, None)
+        if not pending.future.done():
+            pending.future.set_result(_STOPPED)
+        await self._edit(pending, STOPPED_TEXT)
+
     async def on_callback(self, callback_query: Any) -> None:
         """Handle a tap on an ``ask:{ask_id}:{idx}`` button."""
         pending, idx = self._parse(callback_query.data)
-        if pending is None or idx is None or pending.future.done():
+        if (
+            pending is None
+            or idx is None
+            or idx > len(pending.options)
+            or pending.future.done()
+        ):
             await self._answer_query(callback_query.id, EXPIRED_NOTICE)
             return
         await self._answer_query(callback_query.id)
         if idx == len(pending.options):  # the "Other…" button
-            pending.awaiting_text = True
             await self._edit(pending, f"{TYPE_PROMPT}\n\n{pending.question}")
             return
         pending.future.set_result(pending.options[idx])
@@ -125,12 +147,17 @@ class AskBridge:
         tool_input: dict[str, Any],
     ) -> PermissionResultAllow | PermissionResultDeny:
         lock = self._locks.setdefault(topic_key, asyncio.Lock())
+        generation = self._generation.get(topic_key, 0)
         async with lock:  # a second ask in this topic waits its turn
+            if self._generation.get(topic_key, 0) != generation:
+                return PermissionResultDeny(message=STOPPED_TEXT)  # run ended
             run.pause_watchdog()
             try:
                 answers: dict[str, str] = {}
                 for q in tool_input.get("questions") or []:
                     answer = await self._ask_one(topic_key, chat_id, thread_id, q)
+                    if answer is _STOPPED:
+                        return PermissionResultDeny(message=STOPPED_TEXT)
                     if answer is None:
                         await run.interrupt(DENY_MESSAGE)  # defensive
                         return PermissionResultDeny(
@@ -148,8 +175,8 @@ class AskBridge:
 
     async def _ask_one(
         self, topic_key: str, chat_id: int, thread_id: int | None, q: dict[str, Any]
-    ) -> str | None:
-        """Ask one question; the answer, or None on expiry."""
+    ) -> Any:
+        """Ask one question; the answer, None on expiry, or _STOPPED."""
         question = q.get("question", "")
         labels = [str(o.get("label", "")) for o in q.get("options") or []]
         ask_id = secrets.token_hex(4)
@@ -169,7 +196,10 @@ class AskBridge:
             raise
         finally:
             self._by_id.pop(ask_id, None)
-            self._by_topic.pop(topic_key, None)
+            if self._by_topic.get(topic_key) is pending:
+                self._by_topic.pop(topic_key, None)
+        if answer is _STOPPED:  # cancel_topic already edited the message
+            return _STOPPED
         await self._edit(pending, f"✅ {answer}")
         return answer
 

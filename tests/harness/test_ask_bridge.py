@@ -239,6 +239,7 @@ async def test_cancel_while_pending_resumes_watchdog_and_clears(bridge, bot):
     task.cancel()
     await asyncio.gather(task, return_exceptions=True)
     assert run.log == ["pause", "resume"]
+    assert bot.calls_for("edit_message_text")[-1]["text"] == "cancelled"
     assert await bridge.try_answer_with_text(TOPIC, "x") is False
 
 
@@ -350,4 +351,102 @@ async def test_router_routes_typed_message_to_pending_question(tmp_path, setting
 
     assert captured["answer"].updated_input["answers"] == {"Which color?": "blue"}
     assert factory.client.queries == ["pick a color"]  # "blue" was not injected
+    await db.close()
+
+
+# ---------------------------------------------------------- run-end cleanup
+
+
+async def test_cancel_topic_cleans_ask_whose_task_is_not_cancelled(bridge, bot):
+    run1, old = await start_ask(bridge)
+    await until(lambda: len(bot.calls_for("send_message")) == 1)
+    run1b, queued = await start_ask(bridge)  # queued behind the dead run's ask
+    await asyncio.sleep(0)
+    await bridge.cancel_topic(TOPIC)  # the SDK never cancelled `old`
+    assert bot.calls_for("edit_message_text")[-1]["text"] == "stopped"
+    assert await bridge.try_answer_with_text(TOPIC, "swallowed?") is False
+    run2, new = await start_ask(bridge)  # the next run asks immediately
+    await until(lambda: len(bot.calls_for("send_message")) == 2)
+    assert isinstance(await old, PermissionResultDeny)
+    assert isinstance(await queued, PermissionResultDeny)  # dead run's queue drops
+    assert len(bot.calls_for("send_message")) == 2
+    assert await bridge.try_answer_with_text(TOPIC, "blue") is True
+    assert (await new).updated_input["answers"] == {"Which color?": "blue"}
+
+
+async def test_cancel_topic_without_pending_is_noop(bridge, bot):
+    await bridge.cancel_topic(TOPIC)
+    assert bot.calls == []
+
+
+async def test_out_of_range_button_index_is_expired(bridge, bot):
+    run, task = await start_ask(bridge)
+    await until(lambda: bot.calls_for("send_message"))
+    ask_id = buttons(bot)[0][1].split(":")[1]
+    await bridge.on_callback(tap(f"ask:{ask_id}:99"))
+    assert bot.calls_for("answer_callback_query")[-1]["text"] == "expired"
+    assert not task.done()
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_router_cancel_with_pending_question_frees_next_message(
+    tmp_path, settings, bot
+):
+    db = DatabaseManager(f"sqlite:///{tmp_path / 'bot.db'}")
+    await db.initialize()
+    store = SessionStore(db, projects_root=tmp_path / "projects")
+    bridge = AskBridge(bot, settings, expiry_seconds=60)
+    captured: dict = {}
+
+    def ask() -> None:  # fire and forget: nothing ever cancels this task
+        captured["task"] = asyncio.create_task(
+            captured["cb"]("AskUserQuestion", ASK_INPUT, CTX)
+        )
+
+    factories = [
+        FakeSDKClient.factory([(0, fakes.message_start()), ("call", ask)]),
+        FakeSDKClient.factory(
+            [(0, fakes.message_start()), (0, fakes.result(text="fresh run"))]
+        ),
+    ]
+
+    def make_run(options, on_progress):
+        captured["cb"] = options.can_use_tool
+        return AgentRun(
+            options,
+            on_progress,
+            settings,
+            factories.pop(0),
+            interrupt_timeout=0.05,
+            cleanup_timeout=0.05,
+            progress_timeout=0.05,
+        )
+
+    cwd = tmp_path / TOPIC
+    cwd.mkdir()
+    router = TopicRouter(
+        bot,
+        store,
+        RunSlots(3),
+        settings,
+        lambda inbound: TopicContext(inbound.topic_key, cwd, None),
+        ask_bridge=bridge,
+        run_factory=make_run,
+    )
+
+    def inbound(text: str, mid: int) -> Inbound:
+        return Inbound(TOPIC, CHAT, THREAD, mid, 1, text)
+
+    first = asyncio.create_task(router.handle(inbound("go", 100)))
+    await until(
+        lambda: any("reply_markup" in kw for kw in bot.calls_for("send_message"))
+    )
+    assert await router.cancel(TOPIC) is True
+    await asyncio.wait_for(first, 5)
+    assert bot.calls_for("edit_message_text")[-1]["text"] != "✅ next"
+
+    await asyncio.wait_for(router.handle(inbound("next", 101)), 5)
+    assert factories == []  # "next" started a second run instead of being eaten
+    assert isinstance(await captured["task"], PermissionResultDeny)
     await db.close()

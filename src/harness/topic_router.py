@@ -64,6 +64,10 @@ class AskBridgeLike(Protocol):
         """Consume ``text`` as the answer to a pending question; True if used."""
         ...
 
+    async def cancel_topic(self, topic_key: str) -> None:
+        """Drop any pending question for the topic (its run has ended)."""
+        ...
+
     def make_can_use_tool(
         self, topic_key: str, chat_id: int, thread_id: int | None, run: "RunRef"
     ) -> CanUseTool:
@@ -363,6 +367,16 @@ class TopicRouter:
             return self._error_result(exc, started)
         finally:
             worker.run = None
+            await self._clear_asks(ctx.topic_key)
+
+    async def _clear_asks(self, topic_key: str) -> None:
+        """Best effort: a dead run must not leave a question pending."""
+        if self._ask_bridge is None:
+            return
+        try:
+            await self._ask_bridge.cancel_topic(topic_key)
+        except Exception:  # noqa: BLE001 - cleanup must not mask the result
+            logger.exception("harness.ask_cancel_failed", topic=topic_key)
 
     def _error_result(self, exc: BaseException, started: float) -> RunResult:
         return RunResult(
