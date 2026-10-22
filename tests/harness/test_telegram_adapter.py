@@ -7,6 +7,7 @@ fakes: the adapter's contract with them is the call it makes.
 """
 
 import asyncio
+import re
 from datetime import datetime
 from itertools import count
 from pathlib import Path
@@ -555,3 +556,99 @@ def test_build_application_wires_every_handler(world):
         world.adapter.on_document,
     }
     assert app.update_processor.max_concurrent_updates > 1
+
+
+# ------------------------------------------------- review round 1 fixes
+
+
+def command_update(text: str, **kw) -> Update:
+    """A slash command the way Telegram tokenizes it.
+
+    A bot_command entity only spans ``[A-Za-z0-9_]`` after the slash, so
+    ``/c22:weekly-plan`` carries an entity for ``/c22`` alone.
+    """
+    head = text.split()[0]
+    length = 1 + len(re.match(r"/(\w*)", head).group(1))
+    entities = [{"type": "bot_command", "offset": 0, "length": length}]
+    upd = update(message(text=text, entities=entities, **kw))
+    # CommandHandler reads the bot's username to match "/cmd@bot" forms.
+    upd.message.set_bot(SimpleNamespace(username="c22bot"))
+    return upd
+
+
+async def dispatch(app, upd: Update, context) -> None:
+    """PTB's dispatch rule: the first matching handler in each group, in order."""
+    for group in sorted(app.handlers):
+        for handler in app.handlers[group]:
+            check = handler.check_update(upd)
+            if check is not None and check is not False:
+                await handler.callback(upd, context)
+                break
+
+
+async def test_unknown_command_reaches_the_agent_unchanged(world):
+    app = world.adapter.build_application()
+    await dispatch(app, command_update("/c22:weekly-plan next week"), world.context)
+    await world.adapter.drain()
+    ((inbound, _),) = world.router.calls
+    assert inbound.text == "/c22:weekly-plan next week"
+
+
+async def test_known_command_fires_only_its_handler(world):
+    app = world.adapter.build_application()
+    await dispatch(app, command_update("/new"), world.context)
+    await world.adapter.drain()
+    assert world.router.new_sessions == [f"{GROUP}:7"]
+    assert world.router.calls == []
+
+
+async def test_unknown_command_from_a_stranger_is_ignored(world):
+    app = world.adapter.build_application()
+    await dispatch(app, command_update("/c22:add-link x", user=STRANGER), world.context)
+    await world.adapter.drain()
+    assert world.router.calls == [] and world.bot.calls == []
+
+
+async def test_unauthorized_text_never_reaches_the_resume_bridge(tmp_path, settings):
+    resume = FakeResumeBridge(True)
+    w = World(tmp_path, settings, resume=resume)
+    await w.send("on_text", text_update("go", user=STRANGER))
+    await w.send("on_text", text_update("go", chat=OTHER_GROUP))
+    assert resume.updates == []
+    assert w.router.calls == []
+
+
+async def test_unauthorized_media_is_never_downloaded_or_transcribed(world):
+    doc = {"file_id": "d", "file_unique_id": "ud", "file_name": "a.pdf"}
+    for user, chat in ((STRANGER, GROUP), (CARL, OTHER_GROUP)):
+        await world.send("on_voice", _voice_update(user=user, chat=chat))
+        await world.send(
+            "on_photo", update(message(user=user, chat=chat, photo=[_photo("p", 5)]))
+        )
+        await world.send(
+            "on_document", update(message(user=user, chat=chat, document=doc))
+        )
+    assert world.voice.calls == []
+    assert world.bot.calls == []  # no get_file, no reply
+    assert not world.inbox.exists()
+    assert world.router.calls == []
+
+
+async def test_voice_after_the_run_returned_takes_the_idle_path(world):
+    # The flow is finishing: the run object is still published but inactive.
+    world.router.runs[f"{GROUP}:7"] = SimpleNamespace(is_active=False, elapsed_s=0.0)
+    await world.send("on_voice", _voice_update())
+    ((_, opening),) = world.router.calls
+    assert opening == "🎙️ heard: 'please draft the recap' · starting"
+    assert len(world.bot.calls_for("delete_message")) == 1
+    assert world.bot.calls_for("edit_message_text") == []
+
+
+async def test_same_named_documents_do_not_overwrite_each_other(world):
+    world.bot.files.update({"d1": b"one", "d2": b"two"})
+    for fid in ("d1", "d2"):
+        doc = {"file_id": fid, "file_unique_id": f"u{fid}", "file_name": "plan.pdf"}
+        await world.send("on_document", update(message(document=doc)))
+    paths = [inbound.attachments[0].path for inbound, _ in world.router.calls]
+    assert paths[0] != paths[1]
+    assert [p.read_bytes() for p in paths] == [b"one", b"two"]

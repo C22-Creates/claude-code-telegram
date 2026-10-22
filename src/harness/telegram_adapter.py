@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any
 
 import structlog
-from telegram import Message, ReplyParameters, Update
+from telegram import Message, MessageEntity, ReplyParameters, Update
 from telegram.ext import (
     AIORateLimiter,
     Application,
@@ -46,6 +46,7 @@ INBOX_ROOT = Path("data/inbox")
 MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024  # the Bot API's getFile limit
 GENERAL_TOPIC_ID = 1  # forum "General" topic; Telegram omits its thread id
 ASK_PREFIX = "ask:"
+COMMAND_PASSTHROUGH_GROUP = 10
 HEARD_PREVIEW_CHARS = 80
 
 START_TEXT = "👋 c22os is listening — message any project topic."
@@ -78,6 +79,15 @@ class _Origin:
     @property
     def topic_key(self) -> str:
         return f"{self.chat_id}:{self.thread_id or 0}"
+
+
+def _command_name(message: Message) -> str:
+    """The leading command's name, lowercased, without ``/`` or ``@bot``."""
+    for entity in message.entities or ():
+        if entity.type == MessageEntity.BOT_COMMAND and entity.offset == 0:
+            raw = message.parse_entity(entity)
+            return raw[1:].split("@")[0].lower()
+    return ""
 
 
 def heard_text(transcript: str, *, starting: bool) -> str:
@@ -140,14 +150,16 @@ class TelegramAdapter:
             .write_timeout(30)
             .build()
         )
-        for name, callback in (
-            ("start", self.on_start),
-            ("new", self.on_new),
-            ("cancel", self.on_cancel),
-            ("status", self.on_status),
-        ):
+        for name, callback in self._commands().items():
             app.add_handler(CommandHandler(name, callback))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.on_text))
+        # Any other /command (e.g. /c22:weekly-plan) goes to the agent as text.
+        # A later group sees every command, so it skips the known ones that
+        # group 0 already handled (mirrors the old orchestrator).
+        app.add_handler(
+            MessageHandler(filters.COMMAND, self.on_other_command),
+            group=COMMAND_PASSTHROUGH_GROUP,
+        )
         app.add_handler(MessageHandler(filters.VOICE, self.on_voice))
         app.add_handler(MessageHandler(filters.PHOTO, self.on_photo))
         app.add_handler(MessageHandler(filters.Document.ALL, self.on_document))
@@ -172,9 +184,34 @@ class TelegramAdapter:
 
     # ------------------------------------------------------------- handlers
 
+    def _commands(self) -> dict[str, Callable[..., Any]]:
+        return {
+            "start": self.on_start,
+            "new": self.on_new,
+            "cancel": self.on_cancel,
+            "status": self.on_status,
+        }
+
     async def on_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if (origin := self._authorize(update)) is not None:
             self._spawn(self._text_flow(update, context.bot, origin), "text")
+
+    async def on_other_command(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Forward an unregistered /command to the agent, text unchanged.
+
+        The command name is read from the leading bot_command entity, as PTB's
+        CommandHandler does: Telegram ends it at the first character outside
+        ``[A-Za-z0-9_]``, so ``/c22:add-link`` is the unknown command ``c22``
+        while ``/new@bot`` is the known ``new``.
+        """
+        message = update.effective_message
+        if message is None or not message.text:
+            return
+        if _command_name(message) in self._commands():
+            return  # its CommandHandler (group 0) already ran
+        await self.on_text(update, context)
 
     async def on_voice(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -293,7 +330,8 @@ class TelegramAdapter:
             return
         inbound = self._inbound(origin, message, processed.prompt, is_voice=True)
         transcript = processed.transcription
-        if self._router.active_run(origin.topic_key) is not None:
+        run = self._router.active_run(origin.topic_key)
+        if run is not None and run.is_active:
             await self._show(
                 bot, origin, message, note, heard_text(transcript, starting=False)
             )

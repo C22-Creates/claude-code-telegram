@@ -18,6 +18,7 @@ MAX_NAME_CHARS = 100
 _MAX_SUFFIX_CHARS = 16
 _UNSAFE = re.compile(r"[^A-Za-z0-9._-]")
 FALLBACK_NAME = "file"
+_MAX_COLLISIONS = 1000
 
 
 def sanitize_filename(name: str) -> str:
@@ -33,10 +34,23 @@ def sanitize_filename(name: str) -> str:
 
 
 def inbox_path(root: Path, topic_key: str, name: str, now: datetime) -> Path:
-    """``root/<topic_key with ':'→'_'>/<YYYYmmdd-HHMMSS>-<safe name>``; dirs made."""
+    """Reserve ``root/<topic_key ':'→'_'>/<YYYYmmdd-HHMMSS>-<safe name>``.
+
+    The file is created empty (exclusively) so two same-named uploads in the
+    same second, even concurrent ones, never share a path: a taken name gets
+    ``-1``, ``-2``... before its extension. The caller overwrites it.
+    """
     folder = root / topic_key.replace(":", "_")
     folder.mkdir(parents=True, exist_ok=True)
-    return folder / f"{now:%Y%m%d-%H%M%S}-{sanitize_filename(name)}"
+    base = Path(f"{now:%Y%m%d-%H%M%S}-{sanitize_filename(name)}")
+    for n in range(_MAX_COLLISIONS):
+        candidate = folder / (f"{base.stem}-{n}{base.suffix}" if n else base.name)
+        try:
+            candidate.touch(exist_ok=False)
+        except FileExistsError:
+            continue
+        return candidate
+    raise FileExistsError(f"no free inbox name for {base.name} in {folder}")
 
 
 def image_block(attachment: Attachment) -> dict[str, Any]:

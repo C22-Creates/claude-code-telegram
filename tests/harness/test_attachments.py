@@ -100,3 +100,13 @@ def test_router_prompt_keeps_the_path_when_the_image_is_unreadable(tmp_path):
         _inbound([Attachment(kind="photo", path=missing, mime="image/jpeg")])
     )
     assert prompt == f"look\n\nAttached file: {missing}"
+
+
+def test_inbox_path_never_reuses_a_taken_name(tmp_path):
+    first = inbox_path(tmp_path, "1:2", "plan.pdf", NOW)
+    second = inbox_path(tmp_path, "1:2", "plan.pdf", NOW)
+    third = inbox_path(tmp_path, "1:2", "plan.pdf", NOW)
+    assert first.name == "20261021-093005-plan.pdf"
+    assert second.name == "20261021-093005-plan-1.pdf"
+    assert third.name == "20261021-093005-plan-2.pdf"
+    assert first.exists() and second.exists()  # reserved on creation
