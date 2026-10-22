@@ -69,46 +69,56 @@ _SEGMENT = re.compile(
     r")$"
 )
 _STDERR_TO_STDOUT = "2>&1"
+# Deny by default: outside single quotes only these characters are allowed.
+# Everything that bash expands or interprets ($ ` \ ! # ~ * ? [ ] { } ( ) < >,
+# a bare &, newlines) is absent, so the scanner never has to model it.
+_SAFE_CHARS = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_./:=,+@%-"
+)
 
 
 def _split_segments(cmd: str) -> list[str] | None:
     """Split on ``&&``, ``||``, ``;``, ``|`` outside quotes; None if unsafe.
 
-    Single quotes are fully literal (jq programs live there). Double quotes
-    still allow ``$(`` and backticks, so those are rejected everywhere. Outside
-    quotes, newlines, ``<``, ``>`` and a bare ``&`` are rejected; the only
-    redirect allowed is the whole token ``2>&1``.
+    Why a character allowlist rather than a list of dangerous constructs: the
+    previous blocklist splitter was bypassed by ANSI-C ``$'...'`` quoting, where
+    bash treats ``\\'`` as an escaped quote and the splitter did not. Here:
+
+    - Outside quotes: only ``_SAFE_CHARS``, spaces, the separators, a whole
+      ``2>&1`` token, and the two quote characters.
+    - Single quotes: fully literal in bash (jq programs live there). Because
+      ``$`` is never allowed outside quotes, ``'`` always opens a plain
+      single-quoted region, never ANSI-C or locale quoting.
+    - Double quotes: only ``_SAFE_CHARS`` and spaces, so nothing inside them
+      can expand or escape.
+    - Newline/CR are rejected everywhere.
     """
+    if "\n" in cmd or "\r" in cmd:
+        return None
     segments: list[str] = []
     cur: list[str] = []
     quote = ""
     i = 0
     while i < len(cmd):
         c = cmd[i]
-        if c in "\n\r`" or cmd.startswith("$(", i):
-            return None
         if quote:
             if c == quote:
                 quote = ""
-            elif c == "\\" and quote == '"':
-                return None  # escapes only literal inside single quotes
+            elif quote == '"' and c not in _SAFE_CHARS and c != " ":
+                return None
             cur.append(c)
             i += 1
             continue
-        if c == "\\":
-            return None  # bash treats \' etc. specially outside single quotes
         if c in "'\"":
             quote = c
         elif (
             cmd.startswith(_STDERR_TO_STDOUT, i)
-            and (i == 0 or cmd[i - 1].isspace())
-            and (i + 4 == len(cmd) or cmd[i + 4].isspace())
+            and (i == 0 or cmd[i - 1] == " ")
+            and (i + 4 == len(cmd) or cmd[i + 4] == " ")
         ):
             cur.append(" ")
             i += 4
             continue
-        elif c in "<>":
-            return None
         elif cmd.startswith(("&&", "||"), i):
             segments.append("".join(cur))
             cur = []
@@ -119,7 +129,7 @@ def _split_segments(cmd: str) -> list[str] | None:
             cur = []
             i += 1
             continue
-        elif c == "&":
+        elif c not in _SAFE_CHARS and c != " ":
             return None
         cur.append(c)
         i += 1

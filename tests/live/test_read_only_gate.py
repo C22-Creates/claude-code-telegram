@@ -55,6 +55,19 @@ BYPASSES = [
     "gog calendar events x --account",
     "gog --account c22 calendar events x",
     "gog calendar create x",
+    # ANSI-C / locale quoting, expansions, globs, comments, history, tilde
+    "echo $'\\''; rm x #'",
+    "echo $'\\'' ; rm x ;#'",
+    'echo $"x"',
+    "echo ${x:=1}",
+    "echo {a,b}",
+    "ls *",
+    "echo a #'",
+    "echo !!",
+    "cat ~/.ssh/id_rsa",
+    "ls\trm",
+    'echo "a b" "$x"',
+    "echo (x)",
 ]
 
 
