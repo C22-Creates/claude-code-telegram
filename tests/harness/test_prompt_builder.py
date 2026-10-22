@@ -120,11 +120,28 @@ def test_agent_denials_apply_even_when_validation_disabled(tmp_path, make_settin
     assert o.disallowed_tools == ["mcp__missive__send_message"]
 
 
-def test_askuserquestion_in_allowed_asserts(tmp_path, make_settings):
+def test_preapproved_tools_stripped_when_callback_given(tmp_path, make_settings):
     cwd = _make_topic(tmp_path)
-    s = make_settings(claude_allowed_tools=["Read", "AskUserQuestion"])
-    with pytest.raises(AssertionError):
-        build_options(cwd, None, s, None, None)
+    s = make_settings(
+        claude_allowed_tools=["Read", "AskUserQuestion", "Bash"],
+        interactive_tool_approval=True,
+        interactive_tool_approval_tools=["Bash"],
+    )
+    o = build_options(cwd, None, s, None, lambda *a: None)
+    assert o.allowed_tools == ["Read"]
+
+
+def test_allowed_tools_kept_without_callback(tmp_path, make_settings):
+    cwd = _make_topic(tmp_path)
+    s = make_settings(claude_allowed_tools=["Read", "Bash"])
+    assert build_options(cwd, None, s, None, None).allowed_tools == ["Read", "Bash"]
+
+
+def test_non_utf8_prompt_file_skipped(tmp_path):
+    cwd = _make_topic(tmp_path)
+    (cwd / "context" / "intent-map.md").write_bytes(b"\xff\xfe\x80bad")
+    prompt, _ = build_system_prompt(cwd, None)
+    assert "CLAUDE-BODY" in prompt and "RECIPES-BODY" in prompt
 
 
 def test_mcp_servers_loaded(tmp_path, make_settings):

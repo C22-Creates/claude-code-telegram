@@ -5,6 +5,12 @@ Mirrors the production construction in ``src/claude/sdk_integration.py``
 for the two intentional changes: ``permission_mode="default"`` with the
 caller's ``can_use_tool`` (the only combination that routes AskUserQuestion to
 the callback) and no security-validator wrapper.
+
+Rule: the CLI auto-approves any tool listed in ``allowed_tools`` without
+calling ``can_use_tool`` (production issue #219). So whenever a callback is
+supplied, every tool it must see (AskUserQuestion, plus the configured
+interactive-approval tools) is stripped from ``allowed_tools`` with a warning.
+A prompt file that is missing or not valid UTF-8 is skipped, never fatal.
 """
 
 from pathlib import Path
@@ -43,7 +49,7 @@ def build_system_prompt(
         path = cwd / rel
         try:
             prompt += "\n\n" + path.read_text(encoding="utf-8")
-        except OSError:
+        except (OSError, UnicodeDecodeError):
             logger.warning("Prompt file missing or unreadable", path=str(path))
 
     denied: List[str] = []
@@ -91,8 +97,17 @@ def build_options(
         disallowed = list(settings.claude_disallowed_tools or [])
     # Agent-level denials are enforcement policy and apply regardless.
     disallowed = [*disallowed, *agent_denied]
-    # A pre-approved AskUserQuestion bypasses can_use_tool and is never asked.
-    assert ASK_TOOL not in allowed, "AskUserQuestion must not be in allowed_tools"
+    if can_use_tool is not None:
+        must_see = {ASK_TOOL}
+        if getattr(settings, "interactive_tool_approval", False):
+            must_see |= set(settings.interactive_tool_approval_tools or ())
+        stripped = [t for t in allowed if t in must_see]
+        if stripped:
+            logger.warning(
+                "Stripping pre-approved tools so can_use_tool sees them",
+                tools=stripped,
+            )
+            allowed = [t for t in allowed if t not in must_see]
 
     options = ClaudeAgentOptions(
         max_turns=settings.claude_max_turns,
