@@ -1,6 +1,7 @@
 """StatusMessage: coalesced status edits and answer delivery (no network)."""
 
 import asyncio
+from html.parser import HTMLParser
 from types import SimpleNamespace
 
 import pytest
@@ -145,14 +146,38 @@ async def test_finish_posts_answer_then_footer_and_no_late_edit():
     assert len(bot.calls_for("edit_message_text")) == 1
 
 
+class _TagChecker(HTMLParser):
+    """Records tag balance problems in Telegram-style HTML."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.stack: list[str] = []
+        self.errors: list[str] = []
+        self.text = ""
+
+    def handle_starttag(self, tag, attrs):
+        self.stack.append(tag)
+
+    def handle_endtag(self, tag):
+        if not self.stack or self.stack.pop() != tag:
+            self.errors.append(tag)
+
+    def handle_data(self, data):
+        self.text += data
+
+
+def parsed(html: str) -> _TagChecker:
+    checker = _TagChecker()
+    checker.feed(html)
+    checker.close()
+    assert checker.errors == [] and checker.stack == []
+    return checker
+
+
 async def test_long_answer_split_and_plaintext_fallback():
     sm, bot, _ = make()
     await sm.open("start")
-    bot.fail_next("send_message", BadRequest("x"))  # consumed by nothing: reset
-    bot._failures.clear()
     text = "\n".join("line %04d " % i + "x" * 80 for i in range(100))[:9000]
-    assert len(text) == 9000
-    # fail the first answer send (2nd send_message call) with a parse error
     bot.fail_next("send_message", BadRequest("Can't parse entities: bad"))
     await sm.finish(done(text))
     sends = bot.calls_for("send_message")[1:]
@@ -161,6 +186,78 @@ async def test_long_answer_split_and_plaintext_fallback():
     assert "parse_mode" not in sends[1]
     assert sends[1]["text"] == text[: len(sends[1]["text"])]
     assert all(len(s["text"]) <= 4096 for s in sends)
+
+
+async def test_special_chars_long_answer_chunks_are_well_formed():
+    sm, bot, _ = make()
+    await sm.open("start")
+    text = " ".join(f"a<b>&c{i} x&y <tag> " for i in range(450))[:9000]
+    await sm.finish(done(text))
+    sends = bot.calls_for("send_message")[1:]
+    assert 4 <= len(sends) <= 8  # escapes inflate the HTML, so more than 3
+    assert all(len(s["text"]) <= 4096 for s in sends)
+    delivered = "".join(parsed(s["text"]).text for s in sends)
+    assert delivered.replace(" ", "").replace("\n", "") == text.replace(
+        " ", ""
+    ).replace("\n", "")
+
+
+async def test_fence_spanning_chunk_boundary_is_closed_and_reopened():
+    sm, bot, _ = make()
+    await sm.open("start")
+    code = "\n".join(f"print({i})  # <&>" for i in range(400))
+    text = f"intro\n```python\n{code}\n```\noutro"
+    assert len(text) > 3800
+    await sm.finish(done(text))
+    sends = bot.calls_for("send_message")[1:]
+    assert len(sends) >= 2
+    for s in sends:
+        assert parsed(s["text"]).stack == []
+        assert "```" not in s["text"]  # every fence converted to <pre>
+    assert sends[0]["text"].count("<pre>") + sends[0]["text"].count("<pre") >= 1
+    assert 'class="language-python"' in sends[1]["text"]
+
+
+async def test_non_parse_bad_request_is_delivery_failure_not_retried():
+    sm, bot, clock = make()
+    await sm.open("start")
+    bot.fail_next("send_message", BadRequest("Message is too long"))
+    await sm.finish(done("a"))
+    assert clock.sleeps == []
+    assert len(bot.calls_for("send_message")) == 2
+    assert "couldn't deliver" in bot.calls_for("edit_message_text")[0]["text"]
+
+
+async def test_retry_after_sleep_is_capped():
+    sm, bot, clock = make()
+    await sm.open("start")
+    bot.fail_next("send_message", RetryAfter(3600))
+    await sm.finish(done("a"))
+    assert clock.sleeps == [60]
+
+
+async def test_update_during_inflight_edit_is_edited_after_interval():
+    sm, bot, clock = make()
+    await sm.open("start")
+    gate, entered = asyncio.Event(), asyncio.Event()
+    real_edit = bot.edit_message_text
+
+    async def gated_edit(**kw):
+        if not entered.is_set():
+            entered.set()
+            await gate.wait()
+        return await real_edit(**kw)
+
+    bot.edit_message_text = gated_edit
+    clock.now = 10
+    await sm.update(ev(tool="First", turn=1))
+    await entered.wait()
+    await sm.update(ev(tool="Second", turn=2))  # lands while edit is in flight
+    gate.set()
+    await settle()
+    texts = [c["text"] for c in bot.calls_for("edit_message_text")]
+    assert texts == ["🔧 First · turn 1 · 3s", "🔧 Second · turn 2 · 3s"]
+    assert clock.sleeps == [5]  # second edit waited out the interval
 
 
 async def test_nine_thousand_chars_three_sends():

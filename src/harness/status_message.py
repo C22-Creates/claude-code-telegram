@@ -20,6 +20,7 @@ edits the status into the outcome footer.
 
 import asyncio
 import contextlib
+import re
 import warnings
 from datetime import timedelta
 from typing import Any, Awaitable, Callable
@@ -34,11 +35,50 @@ from src.harness.util import fmt_elapsed, footer
 
 logger = structlog.get_logger()
 
-# Headroom under Telegram's 4096 limit: HTML conversion expands &, <, > and adds tags.
+# Telegram counts its 4096 limit on the text *after* entity parsing, so HTML escapes
+# and tags would not strictly count. We stay conservative anyway: the converted HTML
+# string of every chunk is kept <= 4096 (oversized chunks are re-split smaller), and
+# 3800 is the first-pass size so that rarely needs to happen.
 ANSWER_CHUNK_CHARS = 3800
+MAX_MESSAGE_CHARS = 4096
+MAX_RETRY_AFTER_SECONDS = 60
+_FENCE_RE = re.compile(r"^```(\w*)[ \t]*$", re.MULTILINE)
 RETRY_DELAYS = (1, 2, 4)
 NO_TEXT_REPLY = "(done — no text reply)"
 DELIVERY_FAILED = "⚠️ couldn't deliver the reply"
+
+
+def _balance_fences(chunks: list[str]) -> list[str]:
+    """Close a ``` fence left open at a chunk's end and reopen it in the next.
+
+    Without this the converter sees an unpaired fence, leaves the backticks as
+    text, and the code loses its formatting for the rest of the answer.
+    """
+    out: list[str] = []
+    open_lang: str | None = None
+    for chunk in chunks:
+        if open_lang is not None:
+            chunk = f"```{open_lang}\n{chunk}"
+            open_lang = None  # the reopening fence below is counted as an opener
+        for m in _FENCE_RE.finditer(chunk):
+            open_lang = None if open_lang is not None else m.group(1)
+        if open_lang is not None:
+            chunk = f"{chunk}\n```"
+        out.append(chunk)
+    return out
+
+
+def _render_chunks(text: str, limit: int) -> list[tuple[str, str]]:
+    """Split markdown into (markdown, html) chunks whose HTML fits one message."""
+    out: list[tuple[str, str]] = []
+    for chunk in _balance_fences(split_message(text, limit)):
+        html = markdown_to_telegram_html(chunk)
+        if len(html) > MAX_MESSAGE_CHARS and len(chunk) > 1:
+            shrunk = int(len(chunk) * MAX_MESSAGE_CHARS / len(html) * 0.9)
+            out.extend(_render_chunks(chunk, max(1, min(shrunk, len(chunk) - 1))))
+        else:
+            out.append((chunk, html))
+    return out
 
 
 class StatusMessage:
@@ -74,6 +114,7 @@ class StatusMessage:
         self._timer: asyncio.Task | None = None
         self._edit_lock = asyncio.Lock()
         self._closed = False
+        self._version = 0  # bumped by every update(); drives the flusher loop
 
     # ------------------------------------------------------------- public API
 
@@ -98,6 +139,7 @@ class StatusMessage:
                 self._unavailable = [*self._unavailable, ev.detail]
         elif ev.kind == "heartbeat":
             self._heartbeat = f"still working · {ev.detail}"
+        self._version += 1
         self._arm_timer()
 
     async def note(self, text: str) -> None:
@@ -136,11 +178,21 @@ class StatusMessage:
             self._timer = asyncio.create_task(self._flush_later())
 
     async def _flush_later(self) -> None:
-        wait = self._interval - (self._clock() - self._last_edit_at)
-        if wait > 0:
-            await self._sleep(wait)
-        if not self._closed:
+        """Edit once per interval until no update() landed during the last edit.
+
+        An update() arriving while the edit is in flight finds this task still
+        running and arms nothing, so the loop must re-check ``_version`` itself.
+        """
+        while not self._closed:
+            wait = self._interval - (self._clock() - self._last_edit_at)
+            if wait > 0:
+                await self._sleep(wait)
+            if self._closed:
+                return
+            seen = self._version  # absorb updates that arrived while sleeping
             await self._edit(self._render())
+            if self._version == seen:
+                return
 
     async def _cancel_timer(self) -> None:
         timer, self._timer = self._timer, None
@@ -185,14 +237,14 @@ class StatusMessage:
                 return True
             text = NO_TEXT_REPLY
         ok = True
-        for chunk in split_message(text, ANSWER_CHUNK_CHARS):
-            ok = await self._send_chunk(chunk) and ok
+        for chunk, html in _render_chunks(text, ANSWER_CHUNK_CHARS):
+            ok = await self._send_chunk(chunk, html) and ok
         return ok
 
-    async def _send_chunk(self, chunk: str) -> bool:
+    async def _send_chunk(self, chunk: str, html: str) -> bool:
         try:
             try:
-                await self._send_retrying(markdown_to_telegram_html(chunk), "HTML")
+                await self._send_retrying(html, "HTML")
             except BadRequest as exc:
                 if "can't parse entities" not in str(exc).lower():
                     raise
@@ -211,9 +263,8 @@ class StatusMessage:
                 with warnings.catch_warnings():  # PTB 22.2+ deprecation notice
                     warnings.simplefilter("ignore")
                     wait = exc.retry_after
-                await self._sleep(
-                    wait.total_seconds() if isinstance(wait, timedelta) else wait
-                )
+                secs = wait.total_seconds() if isinstance(wait, timedelta) else wait
+                await self._sleep(min(secs, MAX_RETRY_AFTER_SECONDS))
             except BadRequest:
                 raise  # a NetworkError subclass, but retrying cannot fix it
             except (NetworkError, TimedOut) as exc:
