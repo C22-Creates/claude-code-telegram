@@ -4,12 +4,13 @@ Mirrors the production construction in ``src/claude/sdk_integration.py``
 (``execute_command``) so a topic behaves the same under the harness, except
 for the two intentional changes: ``permission_mode="default"`` with the
 caller's ``can_use_tool`` (the only combination that routes AskUserQuestion to
-the callback) and no security-validator wrapper.
+the callback). Path and bash boundary checks are not applied here: callers
+wrap ``can_use_tool`` with ``tool_guard.guard_can_use_tool``.
 
 Rule: the CLI auto-approves any tool listed in ``allowed_tools`` without
 calling ``can_use_tool`` (production issue #219). So whenever a callback is
-supplied, every tool it must see (AskUserQuestion, plus the configured
-interactive-approval tools) is stripped from ``allowed_tools`` with a warning.
+supplied, every tool it must see (AskUserQuestion, the guarded file and bash
+tools, plus the configured interactive-approval tools) is stripped from ``allowed_tools`` with a warning.
 A prompt file that is missing or not valid UTF-8 is skipped, never fatal.
 """
 
@@ -22,6 +23,7 @@ from claude_agent_sdk import ClaudeAgentOptions
 from src.config.settings import Settings
 from src.dispatcher.agent_loader import load_agent
 from src.harness.sdk_lifecycle import load_mcp_config
+from src.harness.tool_guard import BASH_TOOLS, FILE_TOOLS
 
 logger = structlog.get_logger()
 
@@ -98,7 +100,7 @@ def build_options(
     # Agent-level denials are enforcement policy and apply regardless.
     disallowed = [*disallowed, *agent_denied]
     if can_use_tool is not None:
-        must_see = {ASK_TOOL}
+        must_see = {ASK_TOOL} | FILE_TOOLS | BASH_TOOLS
         if getattr(settings, "interactive_tool_approval", False):
             must_see |= set(settings.interactive_tool_approval_tools or ())
         stripped = [t for t in allowed if t in must_see]

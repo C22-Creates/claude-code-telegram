@@ -55,6 +55,9 @@ async def summarize_for_carryover(
         model=settings.harness_carryover_model,
         max_turns=1,
         allowed_tools=[],
+        # No built-in tools at all: permission-free ones (Read/Glob/Grep) would
+        # otherwise run with no can_use_tool guard on a resumed full session.
+        tools=[],
         cwd=str(cwd),
         setting_sources=[],
     )

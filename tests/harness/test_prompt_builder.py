@@ -123,12 +123,12 @@ def test_agent_denials_apply_even_when_validation_disabled(tmp_path, make_settin
 def test_preapproved_tools_stripped_when_callback_given(tmp_path, make_settings):
     cwd = _make_topic(tmp_path)
     s = make_settings(
-        claude_allowed_tools=["Read", "AskUserQuestion", "Bash"],
+        claude_allowed_tools=["Glob", "Read", "AskUserQuestion", "Bash"],
         interactive_tool_approval=True,
         interactive_tool_approval_tools=["Bash"],
     )
     o = build_options(cwd, None, s, None, lambda *a: None)
-    assert o.allowed_tools == ["Read"]
+    assert o.allowed_tools == ["Glob"]
 
 
 def test_allowed_tools_kept_without_callback(tmp_path, make_settings):
@@ -151,3 +151,17 @@ def test_mcp_servers_loaded(tmp_path, make_settings):
     s = make_settings(enable_mcp=True, mcp_config_path=str(cfg))
     o = build_options(cwd, None, s, None, None)
     assert o.mcp_servers == {"x": {"command": "y"}}
+
+
+def test_guarded_tools_stripped_from_allowed_when_callback_set(tmp_path, make_settings):
+    from src.harness.tool_guard import BASH_TOOLS, FILE_TOOLS
+
+    async def cb(*a):  # pragma: no cover
+        ...
+
+    s = make_settings(disable_tool_validation=False)
+    assert {"Read", "Write", "Bash"} <= set(s.claude_allowed_tools)
+    o = build_options(_make_topic(tmp_path), None, s, None, cb)
+    banned = FILE_TOOLS | BASH_TOOLS | {"AskUserQuestion"}
+    assert not banned & set(o.allowed_tools)
+    assert "Glob" in o.allowed_tools  # unguarded tools stay pre-approved

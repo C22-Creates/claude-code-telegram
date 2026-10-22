@@ -166,6 +166,7 @@ async def test_carryover_success_and_options():
     assert opts.resume == "s1" and opts.fork_session is True
     assert opts.model == "claude-haiku-5-5" and opts.max_turns == 1
     assert opts.allowed_tools == [] and opts.setting_sources == []
+    assert opts.tools == []
     assert opts.cwd == "/w"
 
 

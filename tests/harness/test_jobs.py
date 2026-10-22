@@ -432,12 +432,19 @@ async def test_boundary_guard_on_every_callback(kind, tmp_path, settings, db):
 
 
 async def test_claude_internal_path_allowed(tmp_path, settings, monkeypatch):
-    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
-    plan = tmp_path / ".claude" / "plans" / "x.md"
+    approved = tmp_path / "approved"
+    approved.mkdir()
+    home = tmp_path / "home"  # outside the approved dir: only the exemption allows
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    plan = home / ".claude" / "plans" / "x.md"
     plan.parent.mkdir(parents=True)
-    cb = await _job_callback(tmp_path, settings)
+    other = home / "notes.md"
+    cb = await _job_callback(approved, settings)
     assert isinstance(
         await cb("Write", {"file_path": str(plan)}, None), PermissionResultAllow
+    )
+    assert isinstance(
+        await cb("Write", {"file_path": str(other)}, None), PermissionResultDeny
     )
 
 
