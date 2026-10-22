@@ -21,6 +21,8 @@ RECORDED = [
     "jq -r '[.[] | select((.start.dateTime // .start.date) | "
     'startswith("2026-10-22"))] | sort_by(.start.dateTime)\' f.json',
     'python3 scripts/contacts-lookup.py "ocean-ledger.com" 2>&1 | head -60',
+    # backslashes are literal inside single quotes (jq string interpolation)
+    "jq -r '.[] | \"\\(.summary) \\(.start.date)\"' f.json",
 ]
 BYPASSES = [
     "ls\nrm -rf /tmp/x",
@@ -42,6 +44,17 @@ BYPASSES = [
     "rm -rf /tmp/x",
     "sort -o out f",
     "python3 -c 'import os'",
+    "echo \\' ; rm x ; echo \\'",
+    'echo "a\\" ; rm x ; echo \\""',
+    "sort --ou=/tmp/f x",
+    "sort -S 1 --compress-program=rm f",
+    "gog calendar events create x",
+    "gog calendar events --crea=1",
+    "gog calendar events --out=/tmp/f",
+    "gog calendar events x --client-secret-file f",
+    "gog calendar events x --account",
+    "gog --account c22 calendar events x",
+    "gog calendar create x",
 ]
 
 

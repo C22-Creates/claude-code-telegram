@@ -8,6 +8,7 @@ local files (cat/grep) can expose local secrets; that is read-only by design.
 """
 
 import re
+import shlex
 from typing import Any
 
 READ_ONLY_DENIAL = "live replay is read-only"
@@ -26,15 +27,45 @@ READ_MCP_TOOLS = frozenset(
     }
 )
 
-_GOG_WRITE_FLAGS = re.compile(
-    r"(?:^|\s)(?:--(?:create|delete|update|add|remove|patch|insert|send|"
-    r"move|set|write)\S*|-d)(?=\s|=|$)"
-)
+_GOG_PREFIX = ("gog", "calendar", "events")
+_GOG_BOOL_FLAGS = frozenset({"--json", "--results-only"})
+_GOG_VALUE_FLAGS = frozenset({"--account", "--from", "--to", "--max"})
+_GOG_VALUE = re.compile(r"^[\w.:+@/-]+$")
+
+
+def gog_read_only(seg: str) -> bool:
+    """``gog calendar events [<calendar-id>] [flags]`` with only the flags the
+    replays use, spelled exactly (no abbreviations, no other subcommands)."""
+    try:
+        tokens = shlex.split(seg)
+    except ValueError:
+        return False
+    if tuple(tokens[:3]) != _GOG_PREFIX:
+        return False
+    rest = tokens[3:]
+    i = 0
+    if rest and not rest[0].startswith("-"):
+        if not _GOG_VALUE.match(rest[0]):
+            return False
+        i = 1
+    while i < len(rest):
+        flag = rest[i]
+        if flag in _GOG_BOOL_FLAGS:
+            i += 1
+        elif flag in _GOG_VALUE_FLAGS and i + 1 < len(rest):
+            if not _GOG_VALUE.match(rest[i + 1]) or rest[i + 1].startswith("-"):
+                return False
+            i += 2
+        else:
+            return False
+    return True
+
+
 _SEGMENT = re.compile(
     r"^(?:"
-    r"gog\s+(?:-{1,2}\S+\s+)*calendar\s+events\b[^\n]*"
+    r"gog\s[^\n]*"
     r"|python3\s+scripts/contacts-lookup\.py\b[^\n]*"
-    r"|(?:cat|ls|jq|head|tail|grep|wc|sort|pwd|echo)(?:\s[^\n]*)?"
+    r"|(?:cat|ls|jq|head|tail|grep|wc|pwd|echo)(?:\s[^\n]*)?"
     r")$"
 )
 _STDERR_TO_STDOUT = "2>&1"
@@ -60,12 +91,12 @@ def _split_segments(cmd: str) -> list[str] | None:
             if c == quote:
                 quote = ""
             elif c == "\\" and quote == '"':
-                cur.append(c)
-                i += 1
-                c = cmd[i] if i < len(cmd) else ""
+                return None  # escapes only literal inside single quotes
             cur.append(c)
             i += 1
             continue
+        if c == "\\":
+            return None  # bash treats \' etc. specially outside single quotes
         if c in "'\"":
             quote = c
         elif (
@@ -106,9 +137,7 @@ def bash_read_only(cmd: str) -> bool:
     for seg in segments:
         if not _SEGMENT.match(seg):
             return False
-        if seg.startswith("gog") and _GOG_WRITE_FLAGS.search(seg):
-            return False
-        if seg.startswith("sort") and re.search(r"\s-\w*o|--output", seg):
+        if seg.startswith("gog") and not gog_read_only(seg):
             return False
     return True
 
