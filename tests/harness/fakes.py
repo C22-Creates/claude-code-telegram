@@ -5,10 +5,12 @@ milliseconds.
 """
 
 import asyncio
+import inspect
 from itertools import count
 from types import SimpleNamespace
 from typing import Any, AsyncIterator, Awaitable, Callable
 
+import telegram
 from claude_agent_sdk.types import (
     AssistantMessage,
     ResultMessage,
@@ -19,6 +21,9 @@ from claude_agent_sdk.types import (
 )
 
 # ---------------------------------------------------------------- SDK builders
+
+
+_TOOL_IDS = count(1)
 
 
 def message_start(parent_tool_use_id: str | None = None) -> StreamEvent:
@@ -48,7 +53,11 @@ def tool_use(
 ) -> AssistantMessage:
     """Assistant message carrying a single tool call."""
     return AssistantMessage(
-        content=[ToolUseBlock(id=f"tu-{name}", name=name, input=input or {})],
+        content=[
+            ToolUseBlock(
+                id=f"tu-{name}-{next(_TOOL_IDS)}", name=name, input=input or {}
+            )
+        ],
         model="fake-model",
         parent_tool_use_id=parent_tool_use_id,
     )
@@ -168,15 +177,28 @@ class FakeSDKClient:
         self.disconnected = True
         self._closed_evt.set()
 
-    async def _race(self, *waits: Awaitable[Any]) -> int:
-        """Await until the first of ``waits`` finishes; return its index."""
-        tasks = [asyncio.ensure_future(w) for w in waits]
+    async def _wait(self, extra: Awaitable[Any] | None = None) -> str:
+        """Wait for close, interrupt, or ``extra``; return which one won.
+
+        Ties resolve deterministically: closed > interrupt > extra, judged from
+        the events' state after waking (not from asyncio's unordered ``done`` set).
+        """
+        tasks = [
+            asyncio.ensure_future(self._closed_evt.wait()),
+            asyncio.ensure_future(self._interrupt_evt.wait()),
+        ]
+        if extra is not None:
+            tasks.append(asyncio.ensure_future(extra))
         try:
-            done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         finally:
             for t in tasks:
                 t.cancel()
-        return tasks.index(next(iter(done)))
+        if self._closed_evt.is_set():
+            return "closed"
+        if self._interrupt_evt.is_set():
+            return "interrupt"
+        return "extra"
 
     def _interrupt_result(self) -> ResultMessage:
         return result(is_error=True, text=None, subtype="error_during_execution")
@@ -194,56 +216,49 @@ class FakeSDKClient:
         if self.raise_on_receive is not None:
             raise self.raise_on_receive
         steps = list(self.script)
+        # ``await_query`` waits for a query() made after the step is reached,
+        # except a leading one, which is satisfied by the initial query() that
+        # the harness sends before it starts reading the stream.
+        started = False
+        await_target: int | None = None
         while True:
+            if self._closed_evt.is_set():
+                return
             if self._interrupt_evt.is_set():
+                await_target = None
                 yield self._consume_interrupt(steps)
+                started = True
                 continue
             if not steps:
-                fired = await self._race(
-                    self._interrupt_evt.wait(), self._closed_evt.wait()
-                )
-                if fired == 1:
+                if await self._wait() == "closed":
                     return
                 continue
             step = steps[0]
             if step[0] == "await_query":
-                if self._query_evt.is_set():
-                    self._query_evt.clear()
+                if await_target is None:
+                    await_target = 0 if not started else len(self.queries)
+                if len(self.queries) > await_target:
                     steps.pop(0)
+                    await_target = None
+                    started = True
                     continue
-                fired = await self._race(
-                    self._query_evt.wait(),
-                    self._interrupt_evt.wait(),
-                    self._closed_evt.wait(),
-                )
-                if fired == 2:
+                self._query_evt.clear()
+                if len(self.queries) > await_target:
+                    continue
+                if await self._wait(self._query_evt.wait()) == "closed":
                     return
                 continue
             if step[0] == "raise":
                 raise step[1]
             delay, message = step
-            if delay:
-                fired = await self._race(
-                    self._sleep(delay),
-                    self._interrupt_evt.wait(),
-                    self._closed_evt.wait(),
-                )
-                if fired == 1:
-                    continue
-                if fired == 2:
-                    return
+            if delay and await self._wait(self._sleep(delay)) != "extra":
+                continue
             steps.pop(0)
+            started = True
             yield message
 
 
 # ------------------------------------------------------------------------- Bot
-
-_REQUIRED = {
-    "send_message": ("chat_id", "text"),
-    "edit_message_text": ("text",),
-    "set_message_reaction": ("chat_id", "message_id"),
-    "answer_callback_query": ("callback_query_id",),
-}
 
 
 class FakeBot:
@@ -268,7 +283,23 @@ class FakeBot:
         return [kw for m, kw in self.calls if m == method]
 
     def _record(self, method: str, kwargs: dict[str, Any]) -> None:
-        missing = [k for k in _REQUIRED[method] if k not in kwargs]
+        params = inspect.signature(getattr(telegram.Bot, method)).parameters
+        unknown = [k for k in kwargs if k not in params]
+        if unknown:
+            raise TypeError(f"{method}() got unexpected keyword argument(s): {unknown}")
+        missing = [
+            n
+            for n, p in params.items()
+            if n != "self" and p.default is inspect.Parameter.empty and n not in kwargs
+        ]
+        if method == "edit_message_text":
+            # Real API: (chat_id and message_id) or inline_message_id.
+            missing = [m for m in missing if m != "text"]
+            has_chat = "chat_id" in kwargs and "message_id" in kwargs
+            if "text" not in kwargs:
+                missing.append("text")
+            if not has_chat and "inline_message_id" not in kwargs:
+                missing.append("chat_id+message_id or inline_message_id")
         if missing:
             raise TypeError(f"{method}() missing required argument(s): {missing}")
         self.calls.append((method, kwargs))

@@ -175,3 +175,63 @@ async def test_bot_fail_next_raises_once_then_recovers():
 async def test_bot_rejects_missing_required_args():
     with pytest.raises(TypeError):
         await FakeBot().send_message(chat_id=1)
+
+
+async def test_bot_rejects_unknown_kwargs():
+    with pytest.raises(TypeError, match="unexpected"):
+        await FakeBot().send_message(chat_id=1, text="a", bogus=True)
+
+
+async def test_bot_edit_requires_message_target():
+    bot = FakeBot()
+    with pytest.raises(TypeError):
+        await bot.edit_message_text(text="x")
+    with pytest.raises(TypeError):
+        await bot.edit_message_text(chat_id=1, text="x")
+    await bot.edit_message_text(inline_message_id="i", text="x")
+    await bot.edit_message_text(chat_id=1, message_id=2, text="x")
+
+
+async def test_await_query_ignores_earlier_query_mid_script():
+    c = FakeSDKClient(
+        [
+            (0, fakes.text("a")),
+            (0, fakes.result()),
+            ("await_query",),
+            (0, fakes.text("b")),
+        ],
+        sleep=_no_sleep,
+    )
+    await c.query("initial")
+    got: list = []
+
+    async def run() -> None:
+        async for m in c.receive_messages():
+            got.append(m)
+
+    task = asyncio.create_task(run())
+    await asyncio.sleep(0.05)
+    assert len(got) == 2  # blocked despite the initial query
+    await c.query("second")
+    await asyncio.sleep(0.05)
+    assert len(got) == 3
+    await c.disconnect()
+    await task
+
+
+async def test_leading_await_query_consumes_initial_query():
+    c = FakeSDKClient([("await_query",), (0, fakes.text("a"))], sleep=_no_sleep)
+    await c.query("initial")
+    assert len(await _take(c, 1)) == 1
+
+
+async def test_close_beats_interrupt_and_step_when_simultaneous():
+    c = FakeSDKClient([(1, fakes.text("a"))], sleep=_no_sleep)
+    await c.interrupt()
+    await c.disconnect()
+    out = [m async for m in c.receive_messages()]
+    assert out == []
+
+
+def test_tool_use_ids_unique():
+    assert fakes.tool_use("Bash").content[0].id != fakes.tool_use("Bash").content[0].id
