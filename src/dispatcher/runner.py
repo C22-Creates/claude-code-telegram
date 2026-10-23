@@ -1,20 +1,21 @@
 """Production task runner: executes a board task as a Claude session.
 
-Builds a prompt from the task, runs it via the existing ClaudeIntegration
-(same path scheduled jobs and Telegram messages already use), and reports the
-result. The worker is told how to self-block via the Hermes CLI when it needs
-a human — the dispatcher reconciles against live board state afterward.
+Builds a prompt from the task, runs it via the harness (``run_job``: fresh
+session, ``scheduled`` slot priority), and reports the result. The worker is
+told how to self-block via the Hermes CLI when it needs a human -- the
+dispatcher reconciles against live board state afterward.
 """
 
 import json
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Awaitable, Callable, Dict, Optional
 
 import structlog
 
-from ..claude.facade import ClaudeIntegration
-from ..utils.constants import SCOPE_HERMES, SYSTEM_USER_ID
-from .agent_loader import load_agent
+from ..harness.jobs import run_job
+from ..harness.run_slots import RunSlots
+from ..harness.types import Outcome, RunResult
+from ..harness.util import footer
 from .service import RunOutcome
 
 logger = structlog.get_logger()
@@ -73,57 +74,49 @@ class ClaudeTaskRunner:
 
     def __init__(
         self,
-        claude_integration: ClaudeIntegration,
         default_working_directory: Path,
         board_db_path: Path,
         hermes_cli_path: Path,
-        default_user_id: int = SYSTEM_USER_ID,
+        *,
+        slots: RunSlots,
+        settings: Any,
+        security_validator: Any,
+        run_job_fn: Callable[..., Awaitable[RunResult]] = run_job,
     ) -> None:
-        self._claude = claude_integration
         self._default_working_directory = default_working_directory
         self._board_db_path = board_db_path
         self._hermes_cli_path = hermes_cli_path
-        self._default_user_id = default_user_id
+        self._slots = slots
+        self._validator = security_validator
+        self._settings = settings
+        self._run_job = run_job_fn
 
     async def run(self, task: Dict[str, Any]) -> RunOutcome:
         working_dir = self._working_directory(task)
-        config = getattr(self._claude, "config", None)
-        identity = None
-        denied: list = []
-        if bool(getattr(config, "agent_loader_enabled", True)):
-            identity, denied = load_agent(task.get("assignee"), working_dir)
-        enforcement = str(getattr(config, "agent_tool_enforcement", "enforce"))
-        if denied and enforcement != "enforce":
-            logger.warning(
-                "Agent tool denials in warn mode; NOT enforced",
-                task_id=task["id"],
-                assignee=task.get("assignee"),
-                would_deny=denied,
-            )
-            denied = []
-        prompt = self._build_prompt(task, identity=identity)
+        # The assignee's identity and tool denials are applied by the harness
+        # (system prompt + disallowed tools), so the prompt carries no identity.
+        prompt = self._build_prompt(task)
         model = resolve_model(task)
         if model:
             logger.info("Model override for task", task_id=task["id"], model=model)
 
-        response = await self._claude.run_command(
-            prompt=prompt,
-            working_directory=working_dir,
-            extra_disallowed_tools=denied or None,
-            user_id=self._default_user_id,
-            force_new=True,  # each task is an independent unit of work
-            model=model,
-            # Board tasks live in their own session scope, so their churn can
-            # never evict a conversation a human is still having. Task state is
-            # durable in board.db, not in the session, which is why force_new
-            # is correct here.
-            scope_key=SCOPE_HERMES,
+        # Each task is an independent unit of work: run_job is always a fresh
+        # session. Task state is durable in board.db, not in the session.
+        result = await self._run_job(
+            prompt,
+            working_dir,
+            task.get("assignee"),
+            self._slots,
+            self._settings,
+            model,
+            security_validator=self._validator,
         )
 
-        if getattr(response, "is_error", False):
-            raise RuntimeError(response.error_type or "Claude returned an error")
-
-        return RunOutcome(content=response.content or "")
+        if result.outcome is Outcome.DONE:
+            return RunOutcome(content=result.text)
+        # ERROR was a raise before; a watchdog/cap STOPPED means the task did
+        # not finish, so it fails the same way rather than recording "done".
+        raise RuntimeError(footer(result))
 
     def _working_directory(self, task: Dict[str, Any]) -> Path:
         payload = task.get("payload")
@@ -131,9 +124,7 @@ class ClaudeTaskRunner:
             return Path(payload["_working_directory"])
         return self._default_working_directory
 
-    def _build_prompt(
-        self, task: Dict[str, Any], identity: Optional[str] = None
-    ) -> str:
+    def _build_prompt(self, task: Dict[str, Any]) -> str:
         task_id = task["id"]
         payload = task.get("payload")
         payload_str = json.dumps(payload, indent=2) if payload is not None else "(none)"
@@ -142,9 +133,7 @@ class ClaudeTaskRunner:
             f"python3 {self._hermes_cli_path} --db {self._board_db_path} "
             f'block {task_id} --reason "<your specific question>"'
         )
-        identity_block = f"{identity}\n\n---\n\n" if identity else ""
         return (
-            f"{identity_block}"
             f"You are working Hermes task `{task_id}`, acting as {assignee}.\n\n"
             f"## Task\n{task['title']}\n\n"
             f"## Payload\n{payload_str}\n\n"

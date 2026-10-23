@@ -12,31 +12,22 @@ import json
 from pathlib import Path
 from typing import Any, List, Literal, Optional
 
-import structlog
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from src.utils.constants import (
-    DEFAULT_CLAUDE_END_TURN_GRACE_SECONDS,
     DEFAULT_CLAUDE_MAX_COST_PER_REQUEST,
     DEFAULT_CLAUDE_MAX_COST_PER_USER,
     DEFAULT_CLAUDE_MAX_TURNS,
     DEFAULT_CLAUDE_TIMEOUT_SECONDS,
-    DEFAULT_CLAUDE_TOOL_IDLE_TIMEOUT_SECONDS,
     DEFAULT_DATABASE_URL,
     DEFAULT_MAX_SESSIONS_PER_USER,
     DEFAULT_PROJECT_THREADS_SYNC_ACTION_INTERVAL_SECONDS,
     DEFAULT_RATE_LIMIT_BURST,
     DEFAULT_RATE_LIMIT_REQUESTS,
     DEFAULT_RATE_LIMIT_WINDOW,
-    DEFAULT_RETRY_BACKOFF_FACTOR,
-    DEFAULT_RETRY_BASE_DELAY,
-    DEFAULT_RETRY_MAX_ATTEMPTS,
-    DEFAULT_RETRY_MAX_DELAY,
     DEFAULT_SESSION_TIMEOUT_HOURS,
 )
-
-logger = structlog.get_logger()
 
 
 class Settings(BaseSettings):
@@ -81,17 +72,6 @@ class Settings(BaseSettings):
         default=["Bash", "Write", "Edit"],
         description="Tool names that require interactive approval when enabled",
     )
-    interactive_tool_approval_timeout_seconds: int = Field(
-        60,
-        description="Seconds to wait for user approval before applying the timeout action",
-    )
-    interactive_tool_approval_timeout_action: Literal["deny", "allow"] = Field(
-        "deny",
-        description=(
-            "Decision applied automatically when the user doesn't respond "
-            "within the timeout: 'deny' (fail closed) or 'allow'"
-        ),
-    )
 
     # Claude settings
     claude_binary_path: Optional[str] = Field(
@@ -113,24 +93,49 @@ class Settings(BaseSettings):
     claude_timeout_seconds: int = Field(
         DEFAULT_CLAUDE_TIMEOUT_SECONDS, description="Claude timeout"
     )
-    claude_tool_idle_timeout_seconds: int = Field(
-        DEFAULT_CLAUDE_TOOL_IDLE_TIMEOUT_SECONDS,
+    # --- Harness v2 (src/harness) ---
+    harness_stall_seconds: int = Field(
+        300, gt=0, description="Seconds of SDK silence before a run counts as stalled"
+    )
+    harness_heartbeat_minutes: List[int] = Field(
+        [20, 40],
+        description="Minutes into a run at which a heartbeat message is posted",
+    )
+    harness_run_cap_seconds: int = Field(
+        3600, gt=0, description="Hard wall-clock cap for a single run"
+    )
+    harness_rotate_idle_seconds: int = Field(
+        7200,
+        gt=0,
+        description="Idle seconds after which a topic's session is rotated",
+    )
+    harness_rotate_transcript_bytes: int = Field(
+        400_000,
+        gt=0,
+        description="Transcript size in bytes above which a session is rotated",
+    )
+    harness_carryover_max_words: int = Field(
+        300, gt=0, description="Max words in the carryover summary for a new session"
+    )
+    harness_concurrency_cap: int = Field(
+        3, gt=0, description="Max runs executing concurrently across topics"
+    )
+    harness_ask_expiry_seconds: int = Field(
+        1800, gt=0, description="Seconds before an unanswered AskUserQuestion expires"
+    )
+    harness_status_edit_interval_seconds: int = Field(
+        5, gt=0, description="Minimum seconds between status-message edits"
+    )
+    harness_end_turn_grace_seconds: int = Field(
+        15,
         gt=0,
         description=(
-            "Max seconds to wait for the next SDK message before treating the "
-            "stream as stalled — catches a single hung step (most often an "
-            "outbound MCP tool call) without spending the whole "
-            "claude_timeout_seconds budget on it. Must be < claude_timeout_seconds."
+            "Seconds to wait for the CLI's ResultMessage after the model ends "
+            "its turn before the harness finishes the run itself"
         ),
     )
-    claude_end_turn_grace_seconds: int = Field(
-        DEFAULT_CLAUDE_END_TURN_GRACE_SECONDS,
-        gt=0,
-        description=(
-            "Seconds to wait for the CLI's result after the model ends its turn "
-            "with no tool call pending, before completing the run with the "
-            "final assistant text and shutting the CLI down."
-        ),
+    harness_carryover_model: str = Field(
+        "claude-haiku-5-5", description="Model used to write the carryover summary"
     )
     claude_max_cost_per_user: float = Field(
         DEFAULT_CLAUDE_MAX_COST_PER_USER, description="Max cost per user"
@@ -140,9 +145,7 @@ class Settings(BaseSettings):
         description="Max cost per individual request (SDK budget cap)",
     )
     # NOTE: When changing this list, also update docs/tools.md,
-    # docs/configuration.md, .env.example,
-    # src/claude/facade.py (_get_admin_instructions),
-    # and src/bot/orchestrator.py (_TOOL_ICONS).
+    # docs/configuration.md and .env.example.
     claude_allowed_tools: Optional[List[str]] = Field(
         default=[
             "Read",
@@ -168,34 +171,6 @@ class Settings(BaseSettings):
     claude_disallowed_tools: Optional[List[str]] = Field(
         default=[],
         description="List of explicitly disallowed Claude tools/commands",
-    )
-
-    # Retry settings
-    claude_retry_max_attempts: int = Field(
-        DEFAULT_RETRY_MAX_ATTEMPTS,
-        ge=0,
-        description="Max retry attempts for transient SDK errors (0 = disabled)",
-    )
-    claude_retry_base_delay: float = Field(
-        DEFAULT_RETRY_BASE_DELAY,
-        ge=0,
-        description=(
-            "Base delay in seconds between retries. "
-            "0 means retries are attempted immediately with no pause."
-        ),
-    )
-    claude_retry_backoff_factor: float = Field(
-        DEFAULT_RETRY_BACKOFF_FACTOR,
-        gt=0,
-        description="Exponential backoff multiplier",
-    )
-    claude_retry_max_delay: float = Field(
-        DEFAULT_RETRY_MAX_DELAY,
-        ge=0,
-        description=(
-            "Maximum delay cap in seconds. "
-            "0 disables the cap entirely (delays grow unbounded with backoff)."
-        ),
     )
 
     # Sandbox settings
@@ -293,39 +268,6 @@ class Settings(BaseSettings):
         description="Conversational agentic mode (default) vs classic command mode",
     )
 
-    # Reply quoting
-    reply_quote: bool = Field(
-        True,
-        description=(
-            "Quote the original user message when replying. "
-            "Set to false for cleaner thread-based conversations."
-        ),
-    )
-
-    # Output verbosity (0=quiet, 1=normal, 2=detailed)
-    verbose_level: int = Field(
-        1,
-        description=(
-            "Bot output verbosity: 0=quiet (final response only), "
-            "1=normal (tool names + reasoning), "
-            "2=detailed (tool inputs + longer reasoning)"
-        ),
-        ge=0,
-        le=2,
-    )
-
-    # Streaming drafts (Telegram sendMessageDraft)
-    enable_stream_drafts: bool = Field(
-        False,
-        description="Stream partial responses via sendMessageDraft (private chats only)",
-    )
-    stream_draft_interval: float = Field(
-        0.3,
-        description="Minimum seconds between draft updates (0.1-5.0)",
-        ge=0.1,
-        le=5.0,
-    )
-
     # Monitoring
     log_level: str = Field("INFO", description="Logging level")
     enable_telemetry: bool = Field(False, description="Enable anonymous telemetry")
@@ -335,14 +277,7 @@ class Settings(BaseSettings):
     debug: bool = Field(False, description="Enable debug mode")
     development_mode: bool = Field(False, description="Enable development features")
 
-    # Webhook settings (optional)
-    webhook_url: Optional[str] = Field(None, description="Webhook URL for bot")
-    webhook_port: int = Field(8443, description="Webhook port")
-    webhook_path: str = Field("/webhook", description="Webhook path")
-
-    # Agentic platform settings
-    enable_api_server: bool = Field(False, description="Enable FastAPI webhook server")
-    api_server_port: int = Field(8080, description="Webhook API server port")
+    # Scheduled jobs (cron -> ScheduledEvent -> harness run_job)
     enable_scheduler: bool = Field(False, description="Enable job scheduler")
 
     # Hermes task-board dispatcher (off by default; see src/dispatcher/)
@@ -384,12 +319,6 @@ class Settings(BaseSettings):
         pattern="^(enforce|warn)$",
     )
 
-    github_webhook_secret: Optional[str] = Field(
-        None, description="GitHub webhook HMAC secret"
-    )
-    webhook_api_secret: Optional[str] = Field(
-        None, description="Shared secret for generic webhook providers"
-    )
     notification_chat_ids: Optional[List[int]] = Field(
         None, description="Default Telegram chat IDs for proactive notifications"
     )
@@ -571,22 +500,6 @@ class Settings(BaseSettings):
         # Check MCP requirements
         if self.enable_mcp and not self.mcp_config_path:
             raise ValueError("mcp_config_path required when enable_mcp is True")
-
-        # A stall watchdog that can't fire before the session timeout is a
-        # silent no-op. Clamp rather than raise: many configs (tests among
-        # them) set a short claude_timeout_seconds without also tuning this,
-        # and clamping keeps the invariant true unconditionally instead of
-        # relying on every caller to hold it by convention.
-        if self.claude_tool_idle_timeout_seconds >= self.claude_timeout_seconds:
-            clamped = max(1, self.claude_timeout_seconds - 1)
-            logger.warning(
-                "claude_tool_idle_timeout_seconds clamped: was >= "
-                "claude_timeout_seconds and could never fire",
-                configured=self.claude_tool_idle_timeout_seconds,
-                claude_timeout_seconds=self.claude_timeout_seconds,
-                clamped_to=clamped,
-            )
-            self.claude_tool_idle_timeout_seconds = clamped
 
         if self.enable_project_threads:
             if (

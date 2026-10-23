@@ -84,6 +84,9 @@ testpaths = ["tests"]
 python_files = "test_*.py"
 addopts = "-v --cov=src --cov-report=html --cov-report=term-missing"
 asyncio_mode = "auto"
+markers = [
+    "live: replays that call the real Claude CLI and MCP servers (need HARNESS_LIVE=1)",
+]
 
 [tool.mypy]
 python_version = "3.11"
