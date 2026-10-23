@@ -26,10 +26,6 @@ from src.utils.constants import (
     DEFAULT_RATE_LIMIT_BURST,
     DEFAULT_RATE_LIMIT_REQUESTS,
     DEFAULT_RATE_LIMIT_WINDOW,
-    DEFAULT_RETRY_BACKOFF_FACTOR,
-    DEFAULT_RETRY_BASE_DELAY,
-    DEFAULT_RETRY_MAX_ATTEMPTS,
-    DEFAULT_RETRY_MAX_DELAY,
     DEFAULT_SESSION_TIMEOUT_HOURS,
 )
 
@@ -66,6 +62,16 @@ class Settings(BaseSettings):
         False,
         description="Allow all Claude tools by bypassing tool validation checks",
     )
+    interactive_tool_approval: bool = Field(
+        False,
+        description=(
+            "Require interactive Telegram approval before executing risky tool calls"
+        ),
+    )
+    interactive_tool_approval_tools: Optional[List[str]] = Field(
+        default=["Bash", "Write", "Edit"],
+        description="Tool names that require interactive approval when enabled",
+    )
 
     # Claude settings
     claude_binary_path: Optional[str] = Field(
@@ -87,6 +93,50 @@ class Settings(BaseSettings):
     claude_timeout_seconds: int = Field(
         DEFAULT_CLAUDE_TIMEOUT_SECONDS, description="Claude timeout"
     )
+    # --- Harness v2 (src/harness) ---
+    harness_stall_seconds: int = Field(
+        300, gt=0, description="Seconds of SDK silence before a run counts as stalled"
+    )
+    harness_heartbeat_minutes: List[int] = Field(
+        [20, 40],
+        description="Minutes into a run at which a heartbeat message is posted",
+    )
+    harness_run_cap_seconds: int = Field(
+        3600, gt=0, description="Hard wall-clock cap for a single run"
+    )
+    harness_rotate_idle_seconds: int = Field(
+        7200,
+        gt=0,
+        description="Idle seconds after which a topic's session is rotated",
+    )
+    harness_rotate_transcript_bytes: int = Field(
+        400_000,
+        gt=0,
+        description="Transcript size in bytes above which a session is rotated",
+    )
+    harness_carryover_max_words: int = Field(
+        300, gt=0, description="Max words in the carryover summary for a new session"
+    )
+    harness_concurrency_cap: int = Field(
+        3, gt=0, description="Max runs executing concurrently across topics"
+    )
+    harness_ask_expiry_seconds: int = Field(
+        1800, gt=0, description="Seconds before an unanswered AskUserQuestion expires"
+    )
+    harness_status_edit_interval_seconds: int = Field(
+        5, gt=0, description="Minimum seconds between status-message edits"
+    )
+    harness_end_turn_grace_seconds: int = Field(
+        15,
+        gt=0,
+        description=(
+            "Seconds to wait for the CLI's ResultMessage after the model ends "
+            "its turn before the harness finishes the run itself"
+        ),
+    )
+    harness_carryover_model: str = Field(
+        "claude-haiku-5-5", description="Model used to write the carryover summary"
+    )
     claude_max_cost_per_user: float = Field(
         DEFAULT_CLAUDE_MAX_COST_PER_USER, description="Max cost per user"
     )
@@ -95,9 +145,7 @@ class Settings(BaseSettings):
         description="Max cost per individual request (SDK budget cap)",
     )
     # NOTE: When changing this list, also update docs/tools.md,
-    # docs/configuration.md, .env.example,
-    # src/claude/facade.py (_get_admin_instructions),
-    # and src/bot/orchestrator.py (_TOOL_ICONS).
+    # docs/configuration.md and .env.example.
     claude_allowed_tools: Optional[List[str]] = Field(
         default=[
             "Read",
@@ -123,34 +171,6 @@ class Settings(BaseSettings):
     claude_disallowed_tools: Optional[List[str]] = Field(
         default=[],
         description="List of explicitly disallowed Claude tools/commands",
-    )
-
-    # Retry settings
-    claude_retry_max_attempts: int = Field(
-        DEFAULT_RETRY_MAX_ATTEMPTS,
-        ge=0,
-        description="Max retry attempts for transient SDK errors (0 = disabled)",
-    )
-    claude_retry_base_delay: float = Field(
-        DEFAULT_RETRY_BASE_DELAY,
-        ge=0,
-        description=(
-            "Base delay in seconds between retries. "
-            "0 means retries are attempted immediately with no pause."
-        ),
-    )
-    claude_retry_backoff_factor: float = Field(
-        DEFAULT_RETRY_BACKOFF_FACTOR,
-        gt=0,
-        description="Exponential backoff multiplier",
-    )
-    claude_retry_max_delay: float = Field(
-        DEFAULT_RETRY_MAX_DELAY,
-        ge=0,
-        description=(
-            "Maximum delay cap in seconds. "
-            "0 disables the cap entirely (delays grow unbounded with backoff)."
-        ),
     )
 
     # Sandbox settings
@@ -248,39 +268,6 @@ class Settings(BaseSettings):
         description="Conversational agentic mode (default) vs classic command mode",
     )
 
-    # Reply quoting
-    reply_quote: bool = Field(
-        True,
-        description=(
-            "Quote the original user message when replying. "
-            "Set to false for cleaner thread-based conversations."
-        ),
-    )
-
-    # Output verbosity (0=quiet, 1=normal, 2=detailed)
-    verbose_level: int = Field(
-        1,
-        description=(
-            "Bot output verbosity: 0=quiet (final response only), "
-            "1=normal (tool names + reasoning), "
-            "2=detailed (tool inputs + longer reasoning)"
-        ),
-        ge=0,
-        le=2,
-    )
-
-    # Streaming drafts (Telegram sendMessageDraft)
-    enable_stream_drafts: bool = Field(
-        False,
-        description="Stream partial responses via sendMessageDraft (private chats only)",
-    )
-    stream_draft_interval: float = Field(
-        0.3,
-        description="Minimum seconds between draft updates (0.1-5.0)",
-        ge=0.1,
-        le=5.0,
-    )
-
     # Monitoring
     log_level: str = Field("INFO", description="Logging level")
     enable_telemetry: bool = Field(False, description="Enable anonymous telemetry")
@@ -290,14 +277,7 @@ class Settings(BaseSettings):
     debug: bool = Field(False, description="Enable debug mode")
     development_mode: bool = Field(False, description="Enable development features")
 
-    # Webhook settings (optional)
-    webhook_url: Optional[str] = Field(None, description="Webhook URL for bot")
-    webhook_port: int = Field(8443, description="Webhook port")
-    webhook_path: str = Field("/webhook", description="Webhook path")
-
-    # Agentic platform settings
-    enable_api_server: bool = Field(False, description="Enable FastAPI webhook server")
-    api_server_port: int = Field(8080, description="Webhook API server port")
+    # Scheduled jobs (cron -> ScheduledEvent -> harness run_job)
     enable_scheduler: bool = Field(False, description="Enable job scheduler")
 
     # Hermes task-board dispatcher (off by default; see src/dispatcher/)
@@ -326,13 +306,19 @@ class Settings(BaseSettings):
     dispatcher_heartbeat_seconds: int = Field(
         120, description="Interval (seconds) for heartbeating in-flight tasks", ge=10
     )
+    agent_loader_enabled: bool = Field(
+        True,
+        description=(
+            "Load agents/<assignee>/ identity + enforcement for Hermes tasks "
+            "(see agents/README.md in c22os)"
+        ),
+    )
+    agent_tool_enforcement: str = Field(
+        "enforce",
+        description="Agent tool denials: 'enforce' blocks at the SDK, 'warn' logs only",
+        pattern="^(enforce|warn)$",
+    )
 
-    github_webhook_secret: Optional[str] = Field(
-        None, description="GitHub webhook HMAC secret"
-    )
-    webhook_api_secret: Optional[str] = Field(
-        None, description="Shared secret for generic webhook providers"
-    )
     notification_chat_ids: Optional[List[int]] = Field(
         None, description="Default Telegram chat IDs for proactive notifications"
     )
@@ -376,7 +362,9 @@ class Settings(BaseSettings):
             return [int(uid) for uid in v]
         return v  # type: ignore[no-any-return]
 
-    @field_validator("claude_allowed_tools", mode="before")
+    @field_validator(
+        "claude_allowed_tools", "interactive_tool_approval_tools", mode="before"
+    )
     @classmethod
     def parse_claude_allowed_tools(cls, v: Any) -> Optional[List[str]]:
         """Parse comma-separated tool names."""

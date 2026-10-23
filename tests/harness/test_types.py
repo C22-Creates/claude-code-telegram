@@ -1,0 +1,101 @@
+"""Tests for harness settings, types and formatting helpers."""
+
+import pytest
+
+from src.config.settings import Settings
+from src.harness.types import Outcome, RunResult
+from src.harness.util import fmt_elapsed, footer, redact_proxy_url, stall_reason
+
+
+def test_fmt_elapsed():
+    assert fmt_elapsed(42) == "42s"
+    assert fmt_elapsed(252) == "4m12s"
+    assert fmt_elapsed(3600) == "60m0s"
+    assert fmt_elapsed(0) == "0s"
+
+
+def _r(outcome, reason="", elapsed=252):
+    return RunResult(outcome=outcome, text="", elapsed_s=elapsed, reason=reason)
+
+
+def test_footer_done():
+    assert footer(_r(Outcome.DONE)) == "✅ done · 4m12s"
+
+
+def test_footer_stopped():
+    assert footer(_r(Outcome.STOPPED, "stalled", 42)) == "⚠️ stopped (stalled) · 42s"
+    assert footer(_r(Outcome.STOPPED, "cancelled", 42)) == (
+        "⚠️ stopped (cancelled) · 42s"
+    )
+
+
+def test_footer_stall_uses_spec_copy():
+    reason = stall_reason("mcp__missive__x", 300)
+    assert reason == "stalled on mcp__missive__x for 5m"
+    assert footer(_r(Outcome.STOPPED, reason, 301)) == (
+        "⚠️ stalled on mcp__missive__x for 5m, stopped. Reply to retry."
+    )
+    assert stall_reason(None, 90) == "stalled on unknown for 1m30s"
+
+
+def test_footer_error_uses_first_line_only():
+    assert footer(_r(Outcome.ERROR, "boom\ntrace")) == "❌ error: boom"
+
+
+def test_footer_error_empty_reason():
+    assert footer(_r(Outcome.ERROR, "")) == "❌ error: "
+
+
+def test_harness_settings_defaults(tmp_path):
+    s = Settings(
+        telegram_bot_token="t",
+        telegram_bot_username="b",
+        approved_directory=str(tmp_path),
+    )
+    assert s.harness_stall_seconds == 300
+    assert s.harness_heartbeat_minutes == [20, 40]
+    assert s.harness_run_cap_seconds == 3600
+    assert s.harness_rotate_idle_seconds == 7200
+    assert s.harness_rotate_transcript_bytes == 400_000
+    assert s.harness_carryover_max_words == 300
+    assert s.harness_concurrency_cap == 3
+    assert s.harness_ask_expiry_seconds == 1800
+    assert s.harness_status_edit_interval_seconds == 5
+    assert s.harness_end_turn_grace_seconds == 15
+    assert s.harness_carryover_model == "claude-haiku-5-5"
+
+
+def test_harness_settings_env_override(tmp_path, monkeypatch):
+    monkeypatch.setenv("HARNESS_STALL_SECONDS", "12")
+    monkeypatch.setenv("HARNESS_HEARTBEAT_MINUTES", "[5, 10]")
+    s = Settings(
+        telegram_bot_token="t",
+        telegram_bot_username="b",
+        approved_directory=str(tmp_path),
+    )
+    assert s.harness_stall_seconds == 12
+    assert s.harness_heartbeat_minutes == [5, 10]
+
+
+# Ported from tests/unit/test_bot/test_core_proxy.py (old bot/core.py helper).
+@pytest.mark.parametrize(
+    "url, expected",
+    [
+        (
+            "http://alice:s3cret@proxy.internal:3128",
+            "http://alice:***@proxy.internal:3128",
+        ),
+        ("https://svc-bot:hunter2@10.0.0.9:8080", "https://svc-bot:***@10.0.0.9:8080"),
+        ("http://proxy.internal:3128", "http://proxy.internal:3128"),
+        ("http://alice@proxy.internal:3128", "http://alice@proxy.internal:3128"),
+        # rpartition on "@" splits on the userinfo separator, not the password.
+        (
+            "http://alice:p@ss@proxy.internal:3128",
+            "http://alice:***@proxy.internal:3128",
+        ),
+        # A URL we cannot parse must never be logged verbatim.
+        ("http://[::1", "<unparsable proxy URL>"),
+    ],
+)
+def test_redact_proxy_url(url, expected):
+    assert redact_proxy_url(url) == expected

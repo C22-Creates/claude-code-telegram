@@ -194,13 +194,11 @@ class DatabaseManager:
 
     async def _get_schema_version(self, conn: aiosqlite.Connection) -> int:
         """Get current schema version."""
-        await conn.execute(
-            """
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS schema_version (
                 version INTEGER PRIMARY KEY
             )
-        """
-        )
+        """)
 
         cursor = await conn.execute("SELECT MAX(version) FROM schema_version")
         row = await cursor.fetchone()
@@ -321,6 +319,59 @@ class DatabaseManager:
 
                 CREATE INDEX IF NOT EXISTS idx_scheduled_jobs_project_slug
                     ON scheduled_jobs(project_slug);
+                """,
+            ),
+            (
+                6,
+                """
+                -- Session scoping. Sessions used to be keyed by
+                -- (user_id, project_path) alone, so every Telegram topic and
+                -- every background job competed for one pool of
+                -- max_sessions_per_user slots: a newsletter task could evict a
+                -- live conversation mid-thread. scope_key adds the missing
+                -- dimension — "chat:<chat_id>:<thread_id>" for conversations,
+                -- "hermes"/"scheduler" for autonomous work. Existing rows keep
+                -- scope_key NULL, which reads as the legacy unscoped bucket.
+                ALTER TABLE sessions ADD COLUMN scope_key TEXT;
+
+                CREATE INDEX IF NOT EXISTS idx_sessions_scope
+                    ON sessions(user_id, project_path, scope_key);
+
+                -- Identity for autonomous background work. Seeded here so the
+                -- sessions/messages foreign keys resolve on the very first
+                -- dispatcher task after deploy. is_allowed = 0: this user must
+                -- never be able to authenticate over Telegram.
+                INSERT OR IGNORE INTO users (user_id, telegram_username, is_allowed)
+                    VALUES (0, 'system', 0);
+                """,
+            ),
+            (
+                7,
+                """
+                -- Harness v2: per-topic session persistence + run-state rows
+                -- for restart recovery. Timestamps are epoch seconds (REAL).
+                CREATE TABLE IF NOT EXISTS harness_sessions (
+                    topic_key TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    cwd TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    last_active REAL NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS harness_runs (
+                    run_id TEXT PRIMARY KEY,
+                    topic_key TEXT NOT NULL,
+                    chat_id INTEGER,
+                    thread_id INTEGER,
+                    status TEXT NOT NULL CHECK(status IN
+                        ('running','done','stopped','error','abandoned')),
+                    started_at REAL NOT NULL,
+                    ended_at REAL,
+                    prompt_head TEXT
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_harness_runs_status
+                    ON harness_runs(status);
                 """,
             ),
         ]

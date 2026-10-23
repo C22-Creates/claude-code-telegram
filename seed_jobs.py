@@ -24,8 +24,8 @@ Analyze what happened in Carl's day and in c22os today. Suggest 1-3 improvements
 Sources to examine (use what's available; skip what isn't):
 1. Git activity (24h): `git log --since="24 hours ago" --name-only --oneline`
 2. Recently modified inbox/, workflows/, .claude/commands/
-3. Today's calendar events across Carl's accounts (Google Workspace MCP; c22, wondercare, personal)
-4. Today's email traffic patterns (Gmail MCP; volume and themes, not content)
+3. Today's calendar events across Carl's accounts (`gog` CLI: `gog calendar events <calendar-id> --today --json --account <c22|nevado|wondercare|personal>` — all four accounts, --account always explicit; do NOT use Google Workspace/Calendar MCP)
+4. Today's email traffic patterns (Missive MCP `mcp__missive__list_conversations`; volume and themes, not content)
 5. Recent bot session history (what commands got used, what tripped up)
 6. claude-mem observations if accessible
 
@@ -91,7 +91,7 @@ Output (max 600 words, weekly synthesis is longer than daily):
 [commands/workflows that are unused or drifted, with disposition recommendation]
 
 ## Time-alignment check
-[one paragraph: is actual calendar time matching Carl's stated 50% WonderCare / 20% consulting / 15% learning / 15% admin target? where is the drift?]
+[one paragraph: is actual calendar time matching Carl's stated ~50% Nevado / ~20% WonderCare / ~15% Consulting+Baldwin / ~15% Admin+Personal target (reallocated 2026-05-03)? where is the drift?]
 
 Rules:
 - Quantify. "Spent 6 hours on learning vs. 2 hours on consulting pipeline this week" is gold. Hand-waving is not.
@@ -120,8 +120,20 @@ JOBS = [
             "Ask him to share what's on his mind: goals for the day, "
             "joyous moments, zone of genius reflections, meaningful connections, "
             "or anything he wants to capture. Keep it to 2-3 sentences, "
-            "inviting and not a wall of text. Vary the prompt each day. "
-            "When he responds with his thoughts, process his reply using "
+            "inviting and not a wall of text. Vary the prompt each day.\n\n"
+            "Before sending the prompt, pull Carl's outstanding ClickUp tasks "
+            "from the Master List (list ID 901215787009) using the ClickUp MCP. "
+            "Filter for tasks that are:\n"
+            "- Due today\n"
+            "- Due this week (next 7 days)\n"
+            "- Overdue (past due date)\n\n"
+            'Include a brief "On your plate" section below the journal prompt '
+            "with the task names and due dates, grouped as Overdue / Due Today / "
+            "Coming Up This Week. Keep it scannable — just task names and dates, "
+            "not full descriptions. If there are no tasks matching, or the "
+            "ClickUp MCP is unavailable/unauthenticated, skip the section "
+            "entirely (never block the journal prompt on ClickUp).\n\n"
+            "When Carl responds with his thoughts, process his reply using "
             "the /c22:journal workflow to structure it, infer Notion properties, "
             "and save to the Journal database."
         ),
@@ -156,6 +168,38 @@ JOBS = [
         "skill": "c22:coach",
         "project_slug": "journal",
         "working_directory_name": "c22os-journal",
+        "prompt": "",
+    },
+    {
+        "name": "weekly-plan",
+        "cron": "30 7 * * 1",  # Mon 7:30 AM
+        "skill": "c22:weekly-plan",
+        "project_slug": "c22os",
+        "working_directory_name": "c22os",
+        "prompt": "",
+    },
+    {
+        "name": "weekly-pre-brief",
+        "cron": "15 8 * * 1",  # Mon 8:15 AM
+        "skill": "c22:weekly-pre-brief",
+        "project_slug": "c22os",
+        "working_directory_name": "c22os",
+        "prompt": "",
+    },
+    {
+        "name": "weekly-audit",
+        "cron": "0 12 * * 3",  # Wed 12:00 PM (matches the command's own spec)
+        "skill": "c22:weekly-audit",
+        "project_slug": "c22os",
+        "working_directory_name": "c22os",
+        "prompt": "",
+    },
+    {
+        "name": "pipeline-review",
+        "cron": "30 8 * * 5",  # Fri 8:30 AM — prep brief for the Carl/Cynthia 1:1 pipeline walk
+        "skill": "c22:pipeline-review",
+        "project_slug": "c22os",
+        "working_directory_name": "c22os",
         "prompt": "",
     },
     {

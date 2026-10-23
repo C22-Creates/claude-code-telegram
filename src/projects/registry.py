@@ -16,6 +16,11 @@ class ProjectDefinition:
     relative_path: Path
     absolute_path: Path
     enabled: bool = True
+    # Optional agent identity for this topic's sessions — loads
+    # agents/<agent>/ via the dispatcher's agent_loader (see the c22os repo,
+    # agents/README.md § Loader contract).
+    agent: str = ""
+
 
 
 class ProjectRegistry:
@@ -70,6 +75,7 @@ def load_project_registry(
         name = str(raw.get("name", "")).strip()
         rel_path_raw = str(raw.get("path", "")).strip()
         enabled = bool(raw.get("enabled", True))
+        agent = str(raw.get("agent", "") or "").strip()
 
         if not slug:
             raise ValueError(f"Project entry at index {idx} is missing 'slug'")
@@ -116,6 +122,7 @@ def load_project_registry(
                 relative_path=rel_path,
                 absolute_path=absolute_path,
                 enabled=enabled,
+                agent=agent,
             )
         )
 

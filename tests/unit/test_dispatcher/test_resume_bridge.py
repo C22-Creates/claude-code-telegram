@@ -102,17 +102,67 @@ class ResumeBridgeTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(resumed)
         self.assertEqual(board.resumed[0][0], "aaaa1111")
 
-    async def test_ambiguous_without_marker_does_not_resume(self):
+    async def test_ambiguous_non_affirmative_without_marker_does_not_resume(self):
         board = FakeBoard()
         board.add_blocked("aaaa1111", chat_id=9)
         board.add_blocked("bbbb2222", chat_id=9)
         bridge = ResumeBridge(board)
 
         resumed = await bridge.try_resume(
-            update_with(FakeMessage(text="yes", chat_id=9)))
+            update_with(FakeMessage(text="file this under Nevado", chat_id=9)))
 
         self.assertFalse(resumed)
-        self.assertEqual(board.resumed, [])  # never guesses
+        self.assertEqual(board.resumed, [])  # never guesses at a specific one
+
+    async def test_bulk_affirmative_resumes_all_candidates(self):
+        # Regression test: a sweep can block N tasks in the same topic at
+        # once. A plain "go" used to match nothing (multiple candidates, no
+        # marker), silently fall through, and leave every task blocked --
+        # which made the *next* sweep re-fan-out duplicate children for the
+        # same meetings. See resume_bridge.py's rule 4.
+        board = FakeBoard()
+        board.add_blocked("aaaa1111", chat_id=9, title="Recap: Meeting A")
+        board.add_blocked("bbbb2222", chat_id=9, title="Recap: Meeting B")
+        board.add_blocked("cccc3333", chat_id=9, title="Recap: Meeting C")
+        bridge = ResumeBridge(board)
+
+        resumed = await bridge.try_resume(
+            update_with(FakeMessage(text="go", chat_id=9)))
+
+        self.assertTrue(resumed)
+        self.assertEqual(
+            sorted(board.resumed),
+            [("aaaa1111", "go"), ("bbbb2222", "go"), ("cccc3333", "go")],
+        )
+
+    async def test_bulk_affirmative_case_and_punctuation_insensitive(self):
+        board = FakeBoard()
+        board.add_blocked("aaaa1111", chat_id=9)
+        board.add_blocked("bbbb2222", chat_id=9)
+        bridge = ResumeBridge(board)
+
+        resumed = await bridge.try_resume(
+            update_with(FakeMessage(text="  Yes!  ", chat_id=9)))
+
+        self.assertTrue(resumed)
+        self.assertEqual(len(board.resumed), 2)
+
+    async def test_marker_still_wins_over_bulk_affirmative_when_present(self):
+        # If Carl reply-to's one specific block, that precise match should
+        # still apply to only that task, not bulk-resume everything, even if
+        # the typed text also happens to look affirmative.
+        board = FakeBoard()
+        board.add_blocked("aaaa1111zzzz", chat_id=9, title="A")
+        board.add_blocked("bbbb2222yyyy", chat_id=9, title="B")
+        bridge = ResumeBridge(board)
+
+        msg = FakeMessage(
+            text="go", chat_id=9,
+            quoted="🔔 Paused — I need your input:\n\nA\n\n(task aaaa1111)")
+        resumed = await bridge.try_resume(update_with(msg))
+
+        self.assertTrue(resumed)
+        self.assertEqual(board.resumed, [("aaaa1111zzzz", "go")])
 
     async def test_no_blocked_tasks(self):
         bridge = ResumeBridge(FakeBoard())

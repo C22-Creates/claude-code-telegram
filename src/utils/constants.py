@@ -18,6 +18,20 @@ DEFAULT_PROJECT_THREADS_SYNC_ACTION_INTERVAL_SECONDS = 1.1
 DEFAULT_SESSION_TIMEOUT_HOURS = 24
 DEFAULT_MAX_SESSIONS_PER_USER = 5
 
+# Identity used for autonomous background work (Hermes dispatcher tasks and
+# scheduled/webhook jobs). Background work is stateless by design — each task
+# gets a fresh session — so it must NOT share a human's session pool, where its
+# churn would evict live conversations. Keeping it distinct also separates cost
+# and audit attribution between "Carl talking" and "the machine working".
+SYSTEM_USER_ID = 0
+SYSTEM_USER_NAME = "system"
+
+# Session scope keys for background work. Chat sessions use
+# "chat:<chat_id>:<thread_id>" so each Telegram topic keeps its own thread.
+SCOPE_HERMES = "hermes"
+SCOPE_SCHEDULER = "scheduler"
+SCOPE_WEBHOOK = "webhook"
+
 # Message limits
 TELEGRAM_MAX_MESSAGE_LENGTH = 4096
 SAFE_MESSAGE_LENGTH = 4000  # Leave room for formatting
@@ -84,12 +98,6 @@ DEFAULT_BACKUP_RETENTION_DAYS = 30
 # Claude Code defaults
 DEFAULT_CLAUDE_BINARY = "claude"
 DEFAULT_CLAUDE_OUTPUT_FORMAT = "stream-json"
-
-# Retry defaults
-DEFAULT_RETRY_MAX_ATTEMPTS = 3
-DEFAULT_RETRY_BASE_DELAY = 1.0
-DEFAULT_RETRY_BACKOFF_FACTOR = 3.0
-DEFAULT_RETRY_MAX_DELAY = 30.0
 
 # Logging
 LOG_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"

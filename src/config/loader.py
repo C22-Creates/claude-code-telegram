@@ -174,8 +174,6 @@ def _get_enabled_features_summary(settings: Settings) -> list[str]:
         features.append("quick_actions")
     if settings.enable_token_auth:
         features.append("token_auth")
-    if settings.webhook_url:
-        features.append("webhook")
     return features
 
 
