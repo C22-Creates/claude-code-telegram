@@ -32,6 +32,7 @@ from telegram.ext import (
     CommandHandler,
     ContextTypes,
     MessageHandler,
+    TypeHandler,
     filters,
 )
 
@@ -51,6 +52,7 @@ MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024  # the Bot API's getFile limit
 GENERAL_TOPIC_ID = 1  # forum "General" topic; Telegram omits its thread id
 ASK_PREFIX = "ask:"
 COMMAND_PASSTHROUGH_GROUP = 10
+UPDATE_LOG_GROUP = -1  # runs before every handler group
 HEARD_PREVIEW_CHARS = 80
 
 START_TEXT = "👋 c22os is listening — message any project topic."
@@ -176,6 +178,9 @@ class TelegramAdapter:
             builder = builder.proxy(proxy_url).get_updates_proxy(proxy_url)
             logger.info("harness.proxy_configured", proxy=redact_proxy_url(proxy_url))
         app = builder.build()
+        # One line per incoming update, so an update no handler acts on is
+        # still visible in the log (a voice note once vanished silently).
+        app.add_handler(TypeHandler(Update, self.log_update), group=UPDATE_LOG_GROUP)
         for name, callback in self._commands().items():
             app.add_handler(CommandHandler(name, callback))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.on_text))
@@ -437,6 +442,24 @@ class TelegramAdapter:
         await file.download_to_drive(custom_path=path)
         return path
 
+    async def log_update(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Log the shape of an incoming update — never its content."""
+        message = update.effective_message
+        kinds = [
+            kind
+            for kind in ("text", "voice", "audio", "video_note", "photo", "document")
+            if message is not None and getattr(message, kind, None)
+        ]
+        logger.info(
+            "harness.update_received",
+            kinds=kinds or ["callback" if update.callback_query else "other"],
+            chat=getattr(update.effective_chat, "id", None),
+            thread=getattr(message, "message_thread_id", None),
+            user=getattr(update.effective_user, "id", None),
+        )
+
     # ------------------------------------------------------- auth & context
 
     def _authorize(self, update: Update) -> _Origin | None:
@@ -445,14 +468,14 @@ class TelegramAdapter:
         chat = update.effective_chat
         allowed = self._settings.allowed_users or []
         if user is None or chat is None or user.id not in allowed:
-            logger.debug(
+            logger.info(
                 "harness.update_ignored", reason="user", user=getattr(user, "id", None)
             )
             return None
         if chat.type == "private":
             return _Origin(chat.id, None, user.id, is_dm=True)
         if chat.id != self._settings.project_threads_chat_id:
-            logger.debug("harness.update_ignored", reason="chat", chat=chat.id)
+            logger.info("harness.update_ignored", reason="chat", chat=chat.id)
             return None
         message = update.effective_message
         thread_id = getattr(message, "message_thread_id", None) if message else None
@@ -468,7 +491,7 @@ class TelegramAdapter:
             lookup = origin.thread_id or GENERAL_TOPIC_ID
             project = await self._threads.resolve_project(origin.chat_id, lookup)
         if project is None or not project.enabled:
-            logger.debug(
+            logger.info(
                 "harness.update_ignored", reason="topic", topic=origin.topic_key
             )
             return None

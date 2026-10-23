@@ -248,6 +248,22 @@ async def test_unmapped_topic_is_ignored_silently(world):
     assert world.bot.calls == []
 
 
+async def test_every_update_and_every_drop_is_logged_at_info(world):
+    voice = {"file_id": "v1", "file_unique_id": "u1", "duration": 3}
+    with capture_logs() as logs:
+        await world.send("log_update", update(message(voice=voice, thread=42)))
+        await world.send("on_text", text_update(user=STRANGER))
+        await world.send("on_text", text_update(chat=OTHER_GROUP))
+        await world.send("on_text", text_update(thread=42))
+    received = [e for e in logs if e["event"] == "harness.update_received"]
+    assert received[0]["kinds"] == ["voice"]
+    assert received[0]["thread"] == 42
+    assert received[0]["log_level"] == "info"
+    ignored = [e for e in logs if e["event"] == "harness.update_ignored"]
+    assert [e["reason"] for e in ignored] == ["user", "chat", "topic"]
+    assert all(e["log_level"] == "info" for e in ignored)
+
+
 async def test_missing_allowed_users_denies_everyone(tmp_path, settings):
     settings.allowed_users = None
     w = World(tmp_path, settings)
