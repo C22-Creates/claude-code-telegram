@@ -938,3 +938,141 @@ async def test_hung_carryover_still_starts_the_run(tmp_path, settings, store):
     assert (await store.get("t")).session_id == "new"
     assert w.slots.in_use == 0
     release.set()
+
+
+# ------------------------- fresh retry only on a CLI exit; ticks during connect
+
+
+class FakeClock:
+    """Fake monotonic time: AgentRun's supervisor sleep drives it."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    async def tick(self, seconds: float) -> None:
+        self.now += seconds
+        await asyncio.sleep(0)
+
+    async def wait(self, seconds: float) -> None:
+        target = self.now + seconds
+        while self.now < target:
+            await asyncio.sleep(0)
+
+
+class TimedBot(FakeBot):
+    """Stamps every status send/edit with fake time."""
+
+    def __init__(self, clock: FakeClock) -> None:
+        super().__init__()
+        self.clock = clock
+        self.stamps: list[float] = []
+
+    async def send_message(self, **kwargs):
+        self.stamps.append(self.clock())
+        return await super().send_message(**kwargs)
+
+    async def edit_message_text(self, **kwargs):
+        self.stamps.append(self.clock())
+        return await super().edit_message_text(**kwargs)
+
+
+class HangConnectClient(FakeSDKClient):
+    async def connect(self, prompt=None):
+        await asyncio.Event().wait()
+
+
+class RejectResumeClient(FakeSDKClient):
+    """What the real CLI does with an unknown --resume: connect() raises."""
+
+    async def connect(self, prompt=None):
+        from claude_agent_sdk import ProcessError
+
+        raise ProcessError(
+            "Claude Code returned an error result: No conversation found",
+            exit_code=1,
+        )
+
+
+def timed_world(tmp_path, settings, store, client_classes):
+    """A World on fake time whose n-th run uses ``client_classes[n]``."""
+    from src.harness.status_message import StatusMessage
+
+    clock = FakeClock()
+    w = World(tmp_path, settings, store, clock=clock)
+    w.bot = TimedBot(clock)
+    w.router._bot = w.bot
+    classes = list(client_classes)
+
+    def make_run(options, on_progress):
+        topic = Path(options.cwd).name
+        steps = w.scripts.get(topic, [[]]).pop(0) if w.scripts.get(topic) else []
+        factory = classes.pop(0).factory(steps, sleep=clock.wait)
+        w.clients.setdefault(topic, []).append(factory.client)
+        return AgentRun(
+            options,
+            on_progress,
+            settings,
+            factory,
+            clock=clock,
+            sleep=clock.tick,
+            interrupt_timeout=0.05,
+            cleanup_timeout=0.05,
+            progress_timeout=0.05,
+        )
+
+    def status(inbound):
+        return StatusMessage(
+            w.bot,
+            inbound.chat_id,
+            inbound.thread_id,
+            inbound.message_id,
+            settings,
+            clock,
+            sleep=clock.wait,
+        )
+
+    w.router._run_factory = make_run
+    w.router._status_factory = status
+    return w, clock
+
+
+async def test_hung_connect_on_resume_is_not_retried_fresh(tmp_path, settings, store):
+    w, clock = timed_world(tmp_path, settings, store, [HangConnectClient])
+    await store.save("t", "live", w.cwd("t"))
+    await asyncio.wait_for(w.router.handle(msg()), 5)
+    assert len(w.clients["t"]) == 1  # exactly one attempt
+    assert w.client("t").options.resume == "live"
+    assert w.edited_texts()[-1].startswith("❌")
+    assert (await store.get("t")).session_id == "live"  # pointer kept
+    assert await run_rows(store) == [("t", "error")]
+    gaps = [b - a for a, b in zip(w.bot.stamps, w.bot.stamps[1:])]
+    assert max(gaps) <= 300, w.bot.stamps
+
+
+async def test_rejected_resume_on_connect_retries_fresh(tmp_path, settings, store):
+    w, _ = timed_world(tmp_path, settings, store, [RejectResumeClient, FakeSDKClient])
+    await store.save("t", "gone", w.cwd("t"))
+    w.script("t", [])
+    w.script("t", simple(session="new"))
+    await asyncio.wait_for(w.router.handle(msg()), 5)
+    assert [c.options.resume for c in w.clients["t"]] == ["gone", None]
+    assert w.edited_texts()[-1].startswith("✅ done")
+    assert (await store.get("t")).session_id == "new"
+
+
+async def test_harness_crash_while_resuming_is_not_retried(tmp_path, settings, store):
+    calls: list = []
+
+    def crashing_run(options, on_progress):
+        calls.append(options.resume)
+        raise RuntimeError("harness bug")
+
+    w = World(tmp_path, settings, store, run_factory=crashing_run)
+    await store.save("t", "live", w.cwd("t"))
+    await w.router.handle(msg())
+    assert calls == ["live"]
+    assert w.edited_texts()[-1].startswith("❌ error")
+    assert (await store.get("t")).session_id == "live"

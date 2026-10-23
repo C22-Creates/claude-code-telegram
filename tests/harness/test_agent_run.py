@@ -465,6 +465,11 @@ class SlowInjectClient(FakeSDKClient):
         await super().query(message, session_id)
 
 
+async def real_tick(_seconds: float) -> None:
+    """A supervisor/connect-watch sleep that does not move fake time."""
+    await asyncio.sleep(0.001)
+
+
 class GatedConnectClient(FakeSDKClient):
     """``connect()`` blocks until the test opens ``gate``."""
 
@@ -579,6 +584,7 @@ async def test_inject_during_connect_is_buffered_after_prompt(settings):
         settings,
         client_cls=GatedConnectClient,
     )
+    h.run._sleep = real_tick  # the gate opens in real time; hold fake time
     task = asyncio.create_task(h.run.run("go"))
     await asyncio.sleep(0.01)
     await h.run.inject("more")  # accepted while still connecting
@@ -591,6 +597,7 @@ async def test_inject_during_connect_is_buffered_after_prompt(settings):
 
 async def test_interrupt_during_connect_returns_promptly(settings):
     h = Harness([], settings, client_cls=GatedConnectClient)
+    h.run._sleep = real_tick
     task = asyncio.create_task(h.run.run("go"))
     await asyncio.sleep(0.01)
     await h.run.interrupt("cancelled")
@@ -817,3 +824,89 @@ async def test_result_reports_events_seen(settings):
     dead = Harness([("raise", CLIConnectionError("No conversation found"))], settings)
     res = await dead.run.run("q")
     assert (res.outcome, res.events_seen) == (Outcome.ERROR, 0)
+
+
+# ------------------------------------- resume-retry marker, connect-phase ticks
+
+
+class SlowConnectClient(FakeSDKClient):
+    """``connect()`` takes ``connect_s`` of fake time (forever when None)."""
+
+    connect_s: float | None = None
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.connects = 0
+
+    async def connect(self, prompt=None):
+        self.connects += 1
+        if self.connect_s is None:
+            await asyncio.Event().wait()
+        await self._sleep(self.connect_s)
+        await super().connect(prompt)
+
+
+class ExitOnConnectClient(FakeSDKClient):
+    """``connect()`` fails the way the real CLI does on an unknown --resume."""
+
+    async def connect(self, prompt=None):
+        from claude_agent_sdk import ProcessError
+
+        raise ProcessError(
+            "Claude Code returned an error result: No conversation found with "
+            "session ID: gone",
+            exit_code=1,
+        )
+
+
+async def test_hung_connect_ticks_then_times_out_without_cli_exit(settings):
+    h = Harness([], settings, client_cls=SlowConnectClient)
+    status, bot = with_status(h, settings)
+    await status.open("⚙️ starting")
+    res = await asyncio.wait_for(h.run.run("q"), 5)
+    assert (res.outcome, res.reason) == (Outcome.ERROR, "agent did not start in time")
+    assert not res.cli_exited
+    assert h.client.connects == 1  # a start timeout is not retried
+    assert [round(e.elapsed_s) for e in h.kinds("tick")] == [60, 120, 180, 240]
+    await status.finish(res)
+    assert bot.edits[-1][1].startswith("❌")
+    times = [0.0, *[t for t, _, _ in bot.edits]]
+    assert max(b - a for a, b in zip(times, times[1:])) <= 300
+
+
+async def test_slow_connect_emits_ticks_then_runs(settings):
+    SlowClient = type("SlowClient", (SlowConnectClient,), {"connect_s": 150.0})
+    h = Harness(
+        [(0, fakes.message_start()), (0, fakes.result(text="ok"))],
+        settings,
+        client_cls=SlowClient,
+    )
+    res = await asyncio.wait_for(h.run.run("q"), 5)
+    assert (res.outcome, res.text) == (Outcome.DONE, "ok")
+    assert [round(e.elapsed_s) for e in h.kinds("tick")] == [60, 120]
+
+
+async def test_cli_exit_before_any_event_is_marked(settings):
+    from claude_agent_sdk import ProcessError
+
+    on_connect = Harness([], settings, client_cls=ExitOnConnectClient)
+    res = await on_connect.run.run("q")
+    assert (res.outcome, res.cli_exited) == (Outcome.ERROR, True)
+    on_read = Harness([("raise", ProcessError("exit", exit_code=1))], settings)
+    assert (await on_read.run.run("q")).cli_exited
+    late = Harness(
+        [(0, fakes.message_start()), ("raise", ProcessError("exit", exit_code=1))],
+        settings,
+    )
+    assert not (await late.run.run("q")).cli_exited  # it had already started
+
+
+async def test_non_cli_failures_are_not_marked_cli_exit(settings):
+    from claude_agent_sdk import CLINotFoundError
+
+    crash = Harness([("raise", RuntimeError("harness bug"))], settings)
+    assert not (await crash.run.run("q")).cli_exited
+    missing = Harness([("raise", CLINotFoundError("no claude"))], settings)
+    assert not (await missing.run.run("q")).cli_exited
+    ok = Harness([(0, fakes.message_start()), (0, fakes.result())], settings)
+    assert not (await ok.run.run("q")).cli_exited

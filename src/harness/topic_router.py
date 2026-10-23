@@ -422,17 +422,19 @@ class TopicRouter:
     def _resume_failed(
         self, worker: TopicWorker, resume: str | None, result: RunResult | None
     ) -> bool:
-        """An ERROR before the CLI said anything while resuming a session.
+        """The CLI exited before saying anything while resuming a session.
 
-        The CLI exits with a generic error when the stored session is gone;
-        without a fresh retry every message would fail until /new or the
-        idle rotation (the old facade's resume fallback).
+        The CLI exits at connect when the stored session is gone; without a
+        fresh retry every message would fail until /new or the idle rotation
+        (the old facade's resume fallback). Only ``cli_exited`` qualifies: a
+        start timeout or a harness crash is no evidence against the session,
+        and retrying a hung start would double the time on "starting".
         """
         return (
             resume is not None
             and result is not None
             and result.outcome is Outcome.ERROR
-            and result.events_seen == 0
+            and result.cli_exited
             and not worker.reset_requested
             and not worker.discard_session
             and not worker.cancel_requested

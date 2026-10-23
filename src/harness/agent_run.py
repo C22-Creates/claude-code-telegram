@@ -22,6 +22,9 @@ from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
     ClaudeSDKClient,
+    CLIConnectionError,
+    CLINotFoundError,
+    ProcessError,
     ResultMessage,
     SystemMessage,
     TextBlock,
@@ -110,7 +113,7 @@ class AgentRun:
         self._active = True
         self._reset_run()
         self._stderr_tail.clear()
-        self._started_at = self._clock()
+        self._started_at = self._last_tick_at = self._clock()
         self._queries_sent = 1  # the prompt; a retry's re-send is not counted
         try:
             for attempt in (1, 2):
@@ -139,6 +142,7 @@ class AgentRun:
             session_id=self.session_id,
             tool_calls=self._tool_calls,
             events_seen=self._events_seen,
+            cli_exited=self._cli_exited,
         )
         self._log_end(result.outcome.value, result.reason)
         return result
@@ -196,7 +200,7 @@ class AgentRun:
 
     def _reset_run(self) -> None:
         self._client: Any = None
-        self._started_at = self._last_event_at = 0.0
+        self._started_at = self._last_event_at = self._last_tick_at = 0.0
         self._answers: list[str] = []  # one per completed turn
         self._turn_text: list[str] = []  # main-agent text of the current call
         self._tool_calls = self._turn = self._queries_sent = 0
@@ -210,6 +214,7 @@ class AgentRun:
         self._outcome: Outcome | None = None
         self._reason = ""
         self._events_seen = 0
+        self._cli_exited = False
 
     def _reset_attempt(self) -> None:
         self._finished = asyncio.Event()
@@ -217,6 +222,7 @@ class AgentRun:
         self._error: BaseException | None = None
         self._attempt_injections: list[Prompt] = []
         self._events_seen = 0
+        self._cli_exited = False
         self._turn_ended = False
         self._interrupt_sent = False
         self._wedged = False
@@ -241,6 +247,15 @@ class AgentRun:
             self._finish(Outcome.STOPPED, self._stop_reason)
             return
         self._error = exc
+        # Only the CLI process itself failing before it said anything marks the
+        # result: that is how an unknown --resume fails (verified: connect()
+        # raises ResultError, a ProcessError). A start timeout, a missing CLI or
+        # a harness bug must not make the router drop the stored session.
+        self._cli_exited = (
+            self._events_seen == 0
+            and isinstance(exc, (ProcessError, CLIConnectionError))
+            and not isinstance(exc, CLINotFoundError)
+        )
         self._finish(Outcome.ERROR, first_line(str(exc)) or type(exc).__name__)
 
     async def _attempt(self, prompt: Prompt) -> None:
@@ -279,11 +294,7 @@ class AgentRun:
         opener = asyncio.ensure_future(self._open(client, prompt))
         stop = asyncio.ensure_future(self._stop_requested.wait())
         try:
-            await asyncio.wait(
-                [opener, stop],
-                timeout=self._settings.harness_stall_seconds,
-                return_when=asyncio.FIRST_COMPLETED,
-            )
+            await self._watch_connect(opener, stop)
         except BaseException:  # caller cancelled: do not leave the opener running
             opener.cancel()
             raise
@@ -302,6 +313,33 @@ class AgentRun:
         else:
             self._fail(TimeoutError("agent did not start in time"))
         return False
+
+    async def _watch_connect(self, opener: Any, stop: Any) -> None:
+        """Wait for *opener* or *stop*, at most the stall bound, ticking meanwhile.
+
+        The supervisor only starts once connected, and the screen shows just
+        "starting" until then: without these ticks a CLI hanging at startup
+        would leave the status unchanged until the bound fires (spec §2).
+        """
+        started = self._clock()
+        while not (opener.done() or stop.done()):
+            now = self._clock()
+            if now - started >= self._settings.harness_stall_seconds:
+                return
+            await self._maybe_tick(now)
+            sleeper = asyncio.ensure_future(self._sleep(self._tick))
+            try:
+                await asyncio.wait(
+                    [opener, stop, sleeper], return_when=asyncio.FIRST_COMPLETED
+                )
+            finally:
+                sleeper.cancel()
+
+    async def _maybe_tick(self, now: float) -> None:
+        """Emit ``tick`` once per TICK_EVENT_SECONDS of the whole run."""
+        if now - self._last_tick_at >= TICK_EVENT_SECONDS:
+            self._last_tick_at = now
+            await self._emit("tick")
 
     async def _open(self, client: Any, prompt: Prompt) -> None:
         await client.connect()
@@ -442,15 +480,12 @@ class AgentRun:
         s = self._settings
         marks = sorted(m * 60 for m in s.harness_heartbeat_minutes)
         cap = s.harness_run_cap_seconds
-        last_tick = self._started_at
         while not self._finished.is_set() and self._stop_reason is None:
             await self._sleep(self._tick)
             now = self._clock()
             while marks and now - self._started_at >= marks[0]:
                 await self._emit("heartbeat", detail=f"{marks.pop(0) // 60}m")
-            if now - last_tick >= TICK_EVENT_SECONDS:
-                last_tick = now
-                await self._emit("tick")
+            await self._maybe_tick(now)
             idle = now - self._last_event_at
             if now - self._started_at >= cap:
                 await self.interrupt(f"hit {round(cap / 60)}m cap")

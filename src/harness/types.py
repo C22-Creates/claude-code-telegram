@@ -63,8 +63,10 @@ class RunResult:
 
     ``reason`` explains STOPPED/ERROR and is empty for DONE. ``events_seen``
     counts SDK messages read in the final attempt: 0 on an ERROR means the CLI
-    died before saying anything (e.g. an unresumable session). Callers should
-    use keyword arguments.
+    died before saying anything. ``cli_exited`` narrows that to the CLI
+    process itself failing (SDK ``ProcessError``/``CLIConnectionError``) before
+    any event -- how an unknown ``--resume`` fails -- as opposed to a start
+    timeout or a harness crash. Callers should use keyword arguments.
     """
 
     outcome: Outcome
@@ -74,3 +76,4 @@ class RunResult:
     session_id: str | None = None
     tool_calls: int = 0
     events_seen: int = 0
+    cli_exited: bool = False
